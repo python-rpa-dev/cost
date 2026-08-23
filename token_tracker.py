@@ -53,13 +53,15 @@ def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, tuple[
             default = _DEFAULT_PRICING
             if "_default" in data:
                 with contextlib.suppress(TypeError, ValueError):
-                    default = tuple(float(v) for v in data["_default"])
+                    vals = [float(v) for v in data["_default"]]
+                    default = (vals[0], vals[1])
             result["__default"] = default
             for key, value in data.items():
                 if key == "_default":
                     continue
                 with contextlib.suppress(TypeError, ValueError):
-                    result[key] = tuple(float(v) for v in value)
+                    vals = [float(v) for v in value]
+                    result[key] = (vals[0], vals[1])
 
     return result
 
@@ -162,6 +164,7 @@ def scan_opencode_db(
     db_path: str | None = None,
     pricing_file: str | None = None,
     obfuscate: bool = False,
+    monthly: bool = True,
 ) -> dict[str, dict[str, float]]:
     """Scan opencode SQLite database and track token usage.
 
@@ -200,7 +203,7 @@ def scan_opencode_db(
     print(f"Scanning {len(rows)} messages from {display_path}...")
 
     totals: dict[str, dict[str, float]] = {}
-    monthly: dict[str, dict[str, float]] = {}
+    by_month: dict[str, dict[str, float]] = {}
     min_time: float | None = None
     max_time: float | None = None
 
@@ -245,14 +248,15 @@ def scan_opencode_db(
                 max_time = ts
 
             month_key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
-            if month_key not in monthly:
-                monthly[month_key] = {"input": 0.0, "output": 0.0}
-            monthly[month_key]["input"] += input_t
-            monthly[month_key]["output"] += output_t
+            if month_key not in by_month:
+                by_month[month_key] = {"input": 0.0, "output": 0.0}
+            by_month[month_key]["input"] += input_t
+            by_month[month_key]["output"] += output_t
 
     # Calculate costs and persist
     grand_input = 0.0
     grand_output = 0.0
+    grand_cost = 0.0
     for key, t in totals.items():
         pricing = _get_pricing(key, overrides)
         t["input_cost"] = t["input"] * pricing[0] / 1_000_000
@@ -261,6 +265,7 @@ def scan_opencode_db(
 
         grand_input += t["input"]
         grand_output += t["output"]
+        grand_cost += t["total_cost"]
 
         track_tokens(key, t["input"], t["output"])
 
@@ -274,15 +279,15 @@ def scan_opencode_db(
     # Display monthly breakdown before grand total
     if monthly:
         print("\nMonthly Breakdown:")
-        for month_key in sorted(monthly.keys()):
-            m = monthly[month_key]
+        for month_key in sorted(by_month.keys()):
+            m = by_month[month_key]
             month_cost = (m["input"] * 0.03 + m["output"] * 0.05) / 1_000_000
             print(
                 f"  {month_key}: input={_fmt(m['input'])}, output={_fmt(m['output'])}, "
                 f"cost=${month_cost:.2f}"
             )
 
-    print(f"\nTotal scanned: input={_fmt(grand_input)}, output={_fmt(grand_output)}")
+    print(f"\nTotal scanned: input={_fmt(grand_input)}, output={_fmt(grand_output)}, cost=${grand_cost:.2f}")
 
     # Date range info
     if min_time is not None and max_time is not None:
@@ -339,7 +344,7 @@ def clear_log() -> None:
 
 def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
     """Parse command-line arguments."""
-    args: dict[str, Any] = {"command": "totals", "pricing_file": None, "obfuscate": False}
+    args: dict[str, Any] = {"command": "totals", "pricing_file": None, "obfuscate": False, "monthly": True}
 
     if len(argv) < 2:
         return args
@@ -352,6 +357,8 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
             args["pricing_file"] = argv[i + 1]
         elif arg == "--obfuscate":
             args["obfuscate"] = True
+        elif arg == "--no-monthly":
+            args["monthly"] = False
 
     return args
 
@@ -368,6 +375,7 @@ def main(argv: list[str] | None = None) -> None:
         scan_opencode_db(
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
+            monthly=parsed.get("monthly", True),
         )
     elif cmd == "scan-json":
         scan_sessions()
