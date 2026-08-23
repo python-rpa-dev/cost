@@ -1,0 +1,56 @@
+{
+  "opencode/big-pickle": {
+    "input": 495105,
+    "output": 17565,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio/google/gemma-4-e2b": {
+    "input": 6221565,
+    "output": 47130,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/google/gemma-4-e2b": {
+    "input": 12193170,
+    "output": 114765,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/google/gemma-4-e4b": {
+    "input": 17187690,
+    "output": 285045,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/nvidia/nemotron-3-nano-4b": {
+    "input": 489135,
+    "output": 2580,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/qwen/qwen3.6-35b-a3b": {
+    "input": 10267693962,
+    "output": 53525192,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/openai/gpt-oss-20b": {
+    "input": 554020,
+    "output": 1026,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/google/gemma-4-31b": {
+    "input": 206092,
+    "output": 2432,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  },
+  "lmstudio_remote/google/gemma-4-26b-a4b": {
+    "input": 12301163,
+    "output": 52619,
+    "input_price_per_m": 1.0,
+    "output_price_per_m": 5.0
+  }
+}
