@@ -256,6 +256,18 @@ class TestScanOpencodeDb:
         assert t["input_cost"] == pytest.approx(2.0)
         assert t["output_cost"] == pytest.approx(4.0)
 
+    def test_malformed_database_returns_empty(self, tmp_path, capsys):
+        # DB file exists but has no `message` table -> should not raise.
+        bad = tmp_path / "bad.db"
+        conn = sqlite3.connect(str(bad))
+        conn.execute("CREATE TABLE something_else (x INTEGER)")
+        conn.commit()
+        conn.close()
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), \
+                patch("token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")):
+            result = scan_opencode_db(db_path=str(bad), monthly=False)
+        assert result == {}
+
 
 class TestParseCliArgs:
     def test_default(self):
@@ -273,6 +285,11 @@ class TestParseCliArgs:
         assert args["pricing_file"] == "p.json"
         assert args["obfuscate"] is True
         assert args["monthly"] is False
+
+    def test_db_path_flag(self):
+        args = _parse_cli_args(["token_tracker.py", "scan", "--db-path", "/tmp/x.db"])
+        assert args["command"] == "scan"
+        assert args["db_path"] == "/tmp/x.db"
 
     def test_invalid_command_raises(self):
         with pytest.raises(SystemExit):

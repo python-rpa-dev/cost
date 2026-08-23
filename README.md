@@ -22,15 +22,19 @@ python token_tracker.py
 | Command | Description |
 |---------|-------------|
 | `python token_tracker.py` | Print per-model totals (input/output tokens + cost) |
-| `python token_tracker.py scan [--pricing-file <path>] [--obfuscate]` | Scan opencode SQLite database |
+| `python token_tracker.py scan [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
 | `python token_tracker.py scan-json` | Scan legacy JSON session files (`.opencode/sessions/*.json`) |
-| `python token_tracker.py pricing` | List all available pricing options and known models |
+| `python token_tracker.py pricing` | Describe how pricing is configured and show the default fallback |
 | `python token_tracker.py clear` | Clear the token log file |
 
 ### Options
 
+- `--db-path <path>` — Scan an explicit opencode.db file (default: auto-detect)
 - `--pricing-file <path>` — Use an external JSON file for pricing overrides
 - `--obfuscate` — Truncate the database path in output to the last 25 characters
+- `--no-monthly` — Suppress the monthly cost breakdown
+
+> A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan`.
 
 ## Data Sources
 
@@ -44,9 +48,9 @@ python token_tracker.py
 
 Pricing resolution follows this priority order (highest to lowest):
 
-1. `--pricing-file <path>` — External JSON file with model-specific pricing
-2. `PRICING` dict in code — Hardcoded known model prices
-3. `_DEFAULT_PRICING` — Fallback default of `(0.03, 0.05)` (input/output per million tokens)
+1. `--pricing-file <path>` — External JSON file with model-specific pricing (exact key match, then most-specific whole-segment match)
+2. `_default` key in the pricing file — Fallback within the file when no key matches
+3. `_DEFAULT_PRICING` — Built-in fallback of `(0.03, 0.05)` ($0.03/M input, $0.05/M output)
 
 ### Pricing File Format
 

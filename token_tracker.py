@@ -216,6 +216,9 @@ def scan_opencode_db(
     try:
         cursor = conn.execute("SELECT data, time_created FROM message")
         rows = cursor.fetchall()
+    except sqlite3.OperationalError as exc:
+        print(f"Could not read the opencode database: {exc}")
+        return {}
     finally:
         conn.close()
 
@@ -378,6 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
     parser.add_argument("--obfuscate", action="store_true", help="Truncate the DB path in output")
     parser.add_argument("--no-monthly", action="store_true", help="Suppress the monthly breakdown")
+    parser.add_argument("--db-path", metavar="PATH", default=None, help="Explicit path to an opencode.db file (scan)")
     return parser
 
 
@@ -389,6 +393,7 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
         "pricing_file": ns.pricing_file,
         "obfuscate": ns.obfuscate,
         "monthly": not ns.no_monthly,
+        "db_path": ns.db_path,
     }
 
 
@@ -402,6 +407,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "scan":
         scan_opencode_db(
+            db_path=parsed.get("db_path"),
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
             monthly=parsed.get("monthly", True),
