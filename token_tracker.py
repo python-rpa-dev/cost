@@ -15,28 +15,6 @@ TOKEN_LOG = Path("token_log.json")
 _LOCK_PATH = str(TOKEN_LOG) + ".lock"
 
 
-# ---------------------------------------------------------------------------
-# Pricing constants
-# ---------------------------------------------------------------------------
-
-_KNOWN_MODELS: dict[str, tuple[float, float]] = {
-    # OpenAI defaults
-    "openai/gpt-4o": (0.03, 0.05),
-    "openai/gpt-4o-mini": (0.03, 0.05),
-    "openai/gpt-4": (0.03, 0.05),
-    "openai/gpt-4-turbo": (0.03, 0.05),
-    "openai/o1": (0.03, 0.05),
-    "openai/o3-mini": (0.03, 0.05),
-    # Anthropic defaults
-    "anthropic/claude-3.5-sonnet": (0.03, 0.05),
-    "anthropic/claude-3-opus": (0.03, 0.05),
-    "anthropic/claude-3-haiku": (0.03, 0.05),
-    "anthropic/claude-3.7-sonnet": (0.03, 0.05),
-    # Google defaults
-    "google/gemini-pro": (0.03, 0.05),
-    "google/gemini-ultra": (0.03, 0.05),
-}
-
 _DEFAULT_PRICING: tuple[float, float] = (0.03, 0.05)
 
 
@@ -90,8 +68,6 @@ def _get_pricing(model_key: str, overrides: dict[str, tuple[float, float]]) -> t
     """Look up pricing for a model key."""
     if model_key in overrides:
         return overrides[model_key]
-    if model_key in _KNOWN_MODELS:
-        return _KNOWN_MODELS[model_key]
     # Try prefix matching (e.g. "qwen" matches "lmstudio/qwen/...")
     for key in overrides:
         if key.startswith("__default"):
@@ -213,9 +189,6 @@ def scan_opencode_db(
 
     # Load pricing
     overrides = _load_pricing_overrides(pricing_file)
-    for key, val in _KNOWN_MODELS.items():
-        if key not in overrides:
-            overrides[key] = val
 
     conn = sqlite3.connect(str(db))
     try:
@@ -227,6 +200,7 @@ def scan_opencode_db(
     print(f"Scanning {len(rows)} messages from {display_path}...")
 
     totals: dict[str, dict[str, float]] = {}
+    monthly: dict[str, dict[str, float]] = {}
     min_time: float | None = None
     max_time: float | None = None
 
@@ -261,7 +235,7 @@ def scan_opencode_db(
         totals[key]["input"] += input_t
         totals[key]["output"] += output_t
 
-        # Track timestamps
+        # Track timestamps and monthly buckets
         time_created = row[1]
         if time_created:
             ts = float(time_created) / 1000 if len(str(time_created)) > 12 else float(time_created)
@@ -269,6 +243,12 @@ def scan_opencode_db(
                 min_time = ts
             if max_time is None or ts > max_time:
                 max_time = ts
+
+            month_key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
+            if month_key not in monthly:
+                monthly[month_key] = {"input": 0.0, "output": 0.0}
+            monthly[month_key]["input"] += input_t
+            monthly[month_key]["output"] += output_t
 
     # Calculate costs and persist
     grand_input = 0.0
@@ -290,6 +270,17 @@ def scan_opencode_db(
             f"  {key}: input={_fmt(t['input'])}, output={_fmt(t['output'])}, "
             f"cost=${t['total_cost']:.2f}"
         )
+
+    # Display monthly breakdown before grand total
+    if monthly:
+        print("\nMonthly Breakdown:")
+        for month_key in sorted(monthly.keys()):
+            m = monthly[month_key]
+            month_cost = (m["input"] * 0.03 + m["output"] * 0.05) / 1_000_000
+            print(
+                f"  {month_key}: input={_fmt(m['input'])}, output={_fmt(m['output'])}, "
+                f"cost=${month_cost:.2f}"
+            )
 
     print(f"\nTotal scanned: input={_fmt(grand_input)}, output={_fmt(grand_output)}")
 
@@ -396,13 +387,7 @@ def _list_pricing_options() -> None:
     print("  3. Specify a custom pricing file: --pricing-file <path>\n")
 
     print(f"Default (no match): ${_DEFAULT_PRICING[0]:.2f}/M input, ${_DEFAULT_PRICING[1]:.2f}/M output\n")
-    print("To add pricing for a model, edit _KNOWN_MODELS in this script:\n")
-
-    if _KNOWN_MODELS:
-        print("Known models with explicit pricing:")
-        for model_key in sorted(_KNOWN_MODELS):
-            pricing = _KNOWN_MODELS[model_key]
-            print(f"  {model_key}: ${pricing[0]:.2f}/M input, ${pricing[1]:.2f}/M output")
+    print("To add pricing for a model, use the --pricing-file option or set PRICING_OVERRIDES:\n")
 
 
 if __name__ == "__main__":

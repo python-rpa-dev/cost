@@ -9,7 +9,6 @@ import pytest
 
 from token_tracker import (
     _DEFAULT_PRICING,
-    _KNOWN_MODELS,
     _fmt,
     _get_pricing,
     _load_pricing_overrides,
@@ -99,7 +98,7 @@ class TestLoadPricingOverrides:
 class TestGetPricing:
     def test_known_model(self):
         result = _get_pricing("openai/gpt-4o", {})
-        assert result == (2.5, 10.0)
+        assert result == (0.03, 0.05)
 
     def test_override_takes_precedence(self):
         overrides = {"my-model": (5.0, 25.0)}
