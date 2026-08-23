@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import sys
@@ -221,9 +222,9 @@ def scan_opencode_db(
         if input_t == 0 and output_t == 0:
             continue
 
-        model_str = _parse_model_str(data)
-        provider = data.get("providerID", data.get("provider", "unknown"))
-        key = f"{provider}/{model_str}" if provider != "unknown" else model_str
+        # _parse_model_str() already returns "provider/model_id[/variant]".
+        # Do NOT prepend the provider again (that produced doubled prefixes).
+        key = _parse_model_str(data)
 
         if key not in totals:
             pricing = _get_pricing(key, overrides)
@@ -249,9 +250,11 @@ def scan_opencode_db(
 
             month_key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
             if month_key not in by_month:
-                by_month[month_key] = {"input": 0.0, "output": 0.0}
+                by_month[month_key] = {"input": 0.0, "output": 0.0, "cost": 0.0}
+            row_pricing = _get_pricing(key, overrides)
             by_month[month_key]["input"] += input_t
             by_month[month_key]["output"] += output_t
+            by_month[month_key]["cost"] += (input_t * row_pricing[0] + output_t * row_pricing[1]) / 1_000_000
 
     # Calculate costs and persist
     grand_input = 0.0
@@ -281,10 +284,9 @@ def scan_opencode_db(
         print("\nMonthly Breakdown:")
         for month_key in sorted(by_month.keys()):
             m = by_month[month_key]
-            month_cost = (m["input"] * 0.03 + m["output"] * 0.05) / 1_000_000
             print(
                 f"  {month_key}: input={_fmt(m['input'])}, output={_fmt(m['output'])}, "
-                f"cost=${month_cost:.2f}"
+                f"cost=${m['cost']:.2f}"
             )
 
     print(f"\nTotal scanned: input={_fmt(grand_input)}, output={_fmt(grand_output)}, cost=${grand_cost:.2f}")
@@ -342,25 +344,34 @@ def clear_log() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="token_tracker",
+        description="Track LLM token usage and costs.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="totals",
+        choices=["totals", "scan", "scan-json", "clear", "pricing"],
+        help="Command to run (default: totals)",
+    )
+    parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
+    parser.add_argument("--obfuscate", action="store_true", help="Truncate the DB path in output")
+    parser.add_argument("--no-monthly", action="store_true", help="Suppress the monthly breakdown")
+    return parser
+
+
 def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
-    """Parse command-line arguments."""
-    args: dict[str, Any] = {"command": "totals", "pricing_file": None, "obfuscate": False, "monthly": True}
-
-    if len(argv) < 2:
-        return args
-
-    cmd = argv[1]
-    args["command"] = cmd
-
-    for i, arg in enumerate(argv[2:], start=2):
-        if arg == "--pricing-file" and i + 1 < len(argv):
-            args["pricing_file"] = argv[i + 1]
-        elif arg == "--obfuscate":
-            args["obfuscate"] = True
-        elif arg == "--no-monthly":
-            args["monthly"] = False
-
-    return args
+    """Parse command-line arguments into a plain dict."""
+    ns = _build_parser().parse_args(argv[1:] if argv else [])
+    return {
+        "command": ns.command,
+        "pricing_file": ns.pricing_file,
+        "obfuscate": ns.obfuscate,
+        "monthly": not ns.no_monthly,
+    }
 
 
 def main(argv: list[str] | None = None) -> None:

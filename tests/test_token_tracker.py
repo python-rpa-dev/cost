@@ -1,9 +1,8 @@
 """Tests for token_tracker module."""
 
 import json
-import tempfile
-from pathlib import Path
-from unittest.mock import patch, mock_open
+import sqlite3
+from unittest.mock import patch
 
 import pytest
 
@@ -11,14 +10,35 @@ from token_tracker import (
     _DEFAULT_PRICING,
     _fmt,
     _get_pricing,
+    _list_pricing_options,
     _load_pricing_overrides,
+    _parse_cli_args,
     _parse_model_str,
     _safe_read_json,
     estimate_tokens,
     get_totals,
+    main,
     scan_opencode_db,
+    scan_sessions,
     track_tokens,
 )
+
+
+def _make_db(tmp_path, rows):
+    """Create a temp opencode-style SQLite DB with the given message rows."""
+    db = tmp_path / "opencode.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE message (data TEXT, time_created INTEGER)")
+        for r in rows:
+            conn.execute(
+                "INSERT INTO message (data, time_created) VALUES (?, ?)",
+                (json.dumps(r), 1_700_000_000),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db
 
 
 class TestFmt:
@@ -172,3 +192,123 @@ class TestScanOpencodeDb:
         with patch("token_tracker.Path.home", return_value=tmp_path):
             result = scan_opencode_db()
             assert result == {}
+
+    def test_single_prefix_key(self, tmp_path, capsys):
+        db = _make_db(
+            tmp_path,
+            rows=[
+                {
+                    "providerID": "lmstudio_remote",
+                    "id": "qwen/qwen3.6-35b-a3b",
+                    "tokens": {"input": 1000, "output": 500},
+                },
+            ],
+        )
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            result = scan_opencode_db(db_path=str(db), monthly=False)
+        assert "lmstudio_remote/qwen/qwen3.6-35b-a3b" in result
+        # Regression: the provider prefix must not be doubled.
+        assert not any(k.startswith("lmstudio_remote/lmstudio_remote/") for k in result)
+
+    def test_pricing_file_resolves_configured_model(self, tmp_path, capsys):
+        db = _make_db(
+            tmp_path,
+            rows=[
+                {
+                    "providerID": "lmstudio_remote",
+                    "id": "qwen/qwen3.6-35b-a3b",
+                    "tokens": {"input": 1_000_000, "output": 1_000_000},
+                },
+            ],
+        )
+        pricing = tmp_path / "pricing.json"
+        pricing.write_text(json.dumps({"lmstudio_remote/qwen/qwen3.6-35b-a3b": [2.0, 4.0]}))
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            result = scan_opencode_db(db_path=str(db), pricing_file=str(pricing), monthly=False)
+        t = result["lmstudio_remote/qwen/qwen3.6-35b-a3b"]
+        # 1M tokens at $2/$4 per million -> exactly $2 input, $4 output (not the default).
+        assert t["input_cost"] == pytest.approx(2.0)
+        assert t["output_cost"] == pytest.approx(4.0)
+
+
+class TestParseCliArgs:
+    def test_default(self):
+        args = _parse_cli_args(["token_tracker.py"])
+        assert args["command"] == "totals"
+        assert args["monthly"] is True
+        assert args["obfuscate"] is False
+        assert args["pricing_file"] is None
+
+    def test_scan_with_flags(self):
+        args = _parse_cli_args(
+            ["token_tracker.py", "scan", "--pricing-file", "p.json", "--obfuscate", "--no-monthly"]
+        )
+        assert args["command"] == "scan"
+        assert args["pricing_file"] == "p.json"
+        assert args["obfuscate"] is True
+        assert args["monthly"] is False
+
+    def test_invalid_command_raises(self):
+        with pytest.raises(SystemExit):
+            _parse_cli_args(["token_tracker.py", "bogus"])
+
+
+class TestMainDispatch:
+    def test_dispatch_scan(self, capsys):
+        with patch("token_tracker.scan_opencode_db") as m:
+            main(["token_tracker.py", "scan"])
+        m.assert_called_once()
+
+    def test_dispatch_totals_default(self, capsys):
+        with patch("token_tracker.get_totals") as m:
+            main(["token_tracker.py"])
+        m.assert_called_once()
+
+    def test_dispatch_clear(self, capsys):
+        with patch("token_tracker.clear_log") as m:
+            main(["token_tracker.py", "clear"])
+        m.assert_called_once()
+
+    def test_dispatch_pricing(self, capsys):
+        with patch("token_tracker._list_pricing_options") as m:
+            main(["token_tracker.py", "pricing"])
+        m.assert_called_once()
+
+    def test_dispatch_scan_json(self, capsys):
+        with patch("token_tracker.scan_sessions") as m:
+            main(["token_tracker.py", "scan-json"])
+        m.assert_called_once()
+
+
+class TestScanSessions:
+    def test_scans_session_files(self, tmp_path, capsys):
+        sess = tmp_path / "sessions"
+        sess.mkdir()
+        (sess / "a.json").write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "hello world foo bar"},
+                        {"role": "assistant", "content": "hi there"},
+                    ],
+                }
+            )
+        )
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            scan_sessions(session_dir=str(sess), model="local-llm")
+        data = json.loads((tmp_path / "token_log.json").read_text())
+        assert data["local-llm"]["input"] > 0
+        assert data["local-llm"]["output"] > 0
+
+
+class TestListPricingOptions:
+    def test_prints_default(self, capsys):
+        _list_pricing_options()
+        out = capsys.readouterr().out
+        assert "pricing" in out.lower()

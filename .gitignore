@@ -21,6 +21,13 @@ build/
 htmlcov/
 coverage.xml
 
+# Ruff
+.ruff_cache/
+
+# Runtime token log (user-specific, regenerable)
+token_log.json
+token_log.json.lock
+
 # IDE
 .vscode/
 .idea/

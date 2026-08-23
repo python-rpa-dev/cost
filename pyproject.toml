@@ -1,3 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "token-tracker"
+version = "0.1.0"
+description = "Track LLM token usage and costs from opencode."
+requires-python = ">=3.9"
+dependencies = [
+    "filelock>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+token-tracker = "token_tracker:main"
+
 [tool.ruff]
 target-version = "py39"
 line-length = 120
