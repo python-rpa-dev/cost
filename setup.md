@@ -20,7 +20,7 @@ Total: input=<N>, output=<N>, cost=$X.XX
 Rough word-to-token estimate (`words * 1.3`).
 
 ### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False)`
-Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing from `--pricing-file`, `PRICING_OVERRIDES`, `_KNOWN_MODELS`, or `_DEFAULT_PRICING_DEFAULT` (in that order). When `obfuscate=True`, the DB path in output is truncated to the last 25 characters.
+Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing via whole-segment matching against `--pricing-file` entries, falling back to the file's `_default` key and then `_DEFAULT_PRICING`. When `obfuscate=True`, the DB path in output is truncated to the last 25 characters.
 
 Scan output format:
 ```
@@ -58,10 +58,9 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 ## Pricing System
 
 ### Priority Order (highest to lowest)
-1. `--pricing-file <path>` — external JSON file with model pricing (supports `_default` key)
-2. `PRICING_OVERRIDES` — in-script dict for quick overrides
-3. `_KNOWN_MODELS` — all models detected from the opencode instance
-4. `_DEFAULT_PRICING_DEFAULT` — fallback when no model match is found (default: `[$1.0/M, $5.0/M]`)
+1. `--pricing-file <path>` — external JSON file with model pricing (exact key match, then most-specific whole-segment match)
+2. `_default` key in the pricing file — fallback within the file when no key matches
+3. `_DEFAULT_PRICING` — built-in fallback when nothing else matches (default: `(0.03, 0.05)` = `$0.03/M input, $0.05/M output`)
 
 ### External Pricing File Format (`pricing.json`)
 ```json
@@ -73,21 +72,21 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 ```
 
 ### Configuration Points
-- `_KNOWN_MODELS` — all known models with their pricing (auto-detected from opencode instance)
-- `_DEFAULT_PRICING_DEFAULT` — fallback pricing for unknown models (default: `(1.0, 5.0)`)
-- `PRICING_OVERRIDES` — user-editable overrides (in-script)
-- `--pricing-file` — external JSON for per-project pricing
+- `_DEFAULT_PRICING` — fallback `(input_per_m, output_per_m)` for any model without a match (default: `(0.03, 0.05)`)
+- `--pricing-file <path>` — external JSON of per-model prices; supports a `_default` key to override the fallback
+- Pricing resolution order: exact key match → most-specific whole-segment match → file `_default` → `_DEFAULT_PRICING`
 
-### Built-in Defaults (OpenAI, Anthropic, Google)
-- OpenAI: gpt-4o ($2.5/$10), gpt-4o-mini ($0.15/$0.6), gpt-4 ($10/$30), gpt-4-turbo ($10/$30), o1 ($15/$60), o3-mini ($1.1/$4.4)
-- Anthropic: claude-3.5-sonnet ($3/$15), claude-3-opus ($15/$75), claude-3-haiku ($0.25/$1.25), claude-3.5-haiku ($0.8/$4), claude-3.7-sonnet ($3/$15)
-- Google: gemini-pro ($0.5/$1.5), gemini-ultra ($2.5/$7.5)
+### No Built-in Per-Model Prices
+There is no hardcoded per-model price table in the code. Every model resolves to
+`_DEFAULT_PRICING` (`$0.03/M input, $0.05/M output`) unless you supply a `--pricing-file`
+with an explicit entry (whole-segment matching applies, so e.g. a `qwen` entry matches
+any `.../qwen/...` model).
 
 ## Output Format
 
 - **Token amounts** — formatted with apostrophe delimiter (e.g. `302'210'678`)
-- **Pricing per line** — each model line shows `input_price=$X.XX/M, output_price=$X.XX/M`
-- **Cost per line** — each model line shows `cost=$X.XX`
+- **Model line** — each model line shows `input=<n>, output=<n>, cost=$X.XX` (token counts use apostrophe delimiter)
+- **Totals** — a grand-total line shows combined `input`, `output`, and `cost`; scan adds a monthly breakdown and date-range span
 - **Scan path** — scan output shows the DB path (or obfuscated version with `--obfuscate`)
 - **Message count** — scan output shows total messages scanned
 
@@ -99,9 +98,9 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 - **Cross-platform DB discovery** — `scan_opencode_db` must auto-detect the opencode SQLite database on Windows (`AppData/Roaming`, `.local/share`) and Linux/macOS (`.local/share`)
 - **Use real token data** — `scan_opencode_db` must read actual `tokens.input` / `tokens.output` from message JSON, not estimate from text
 - **Pricing support** — `track_tokens` must accept `input_price_per_m` and `output_price_per_m` parameters; `get_totals` must compute and display cost per model and total
-- **Configurable pricing** — must support `PRICING_OVERRIDES` dict for user-defined model pricing, a `--pricing-file` CLI flag for external JSON pricing files (with `_default` fallback support), and fallback to `_KNOWN_MODELS` for known providers (OpenAI, Anthropic, Google)
-- **Default fallback pricing** — `_DEFAULT_PRICING_DEFAULT` must be used as fallback when no model match is found; `--pricing-file` JSON files may override it via `_default` key
-- **Pricing listing** — `pricing` CLI command must list all known models with their current pricing configuration, indicating which use the default
+- **Configurable pricing** — must support a `--pricing-file` CLI flag for external JSON pricing files (with `_default` fallback support) and whole-segment matching against configured model keys
+- **Default fallback pricing** — `_DEFAULT_PRICING` (`(0.03, 0.05)`) must be used as fallback when no model match is found; `--pricing-file` JSON files may override it via the `_default` key
+- **Pricing listing** — `pricing` CLI command must describe how pricing is configured (defaults vs `--pricing-file`) and show the current `_DEFAULT_PRICING` fallback
 - **Per-model totals** — `get_totals` must display per-model input + output sum + cost
 - **Scan output cost** — `scan_opencode_db` must display per-model `cost=$X.XX` and total `cost=$X.XX` in scan output
 - **Scan path display** — scan output must show the DB path being scanned

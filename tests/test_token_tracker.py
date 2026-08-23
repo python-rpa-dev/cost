@@ -134,6 +134,28 @@ class TestGetPricing:
         result = _get_pricing("completely-new-model", {})
         assert result == _DEFAULT_PRICING
 
+    def test_path_prefix_match(self):
+        # "lmstudio_remote/qwen" is a leading path prefix of the model key.
+        overrides = {"lmstudio_remote/qwen": (3.0, 4.0)}
+        assert _get_pricing("lmstudio_remote/qwen/qwen3.6-35b-a3b", overrides) == (3.0, 4.0)
+
+    def test_segment_contained_match(self):
+        # A single-segment override matches if it appears as a whole segment.
+        overrides = {"qwen": (5.0, 6.0)}
+        assert _get_pricing("lmstudio_remote/qwen/qwen3.6-35b-a3b", overrides) == (5.0, 6.0)
+
+    def test_no_substring_false_positive(self):
+        # "gpt" must NOT match "gpt2" (whole-segment matching, not substring).
+        overrides = {"openai/gpt": (7.0, 8.0)}
+        assert _get_pricing("openai/gpt2", overrides) == _DEFAULT_PRICING
+
+    def test_most_specific_wins(self):
+        overrides = {
+            "qwen": (1.0, 1.0),
+            "lmstudio_remote/qwen": (2.0, 2.0),
+        }
+        assert _get_pricing("lmstudio_remote/qwen/qwen3.6-35b-a3b", overrides) == (2.0, 2.0)
+
 
 class TestParseModelStr:
     def test_basic(self):

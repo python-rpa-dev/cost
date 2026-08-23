@@ -68,15 +68,32 @@ def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, tuple[
 
 
 def _get_pricing(model_key: str, overrides: dict[str, tuple[float, float]]) -> tuple[float, float]:
-    """Look up pricing for a model key."""
+    """Look up pricing for a model key.
+
+    Resolution order: exact match, then the most specific override whose path
+    segments line up with the model key (as a leading prefix or as full
+    contained segments), else the default. Matching is done on whole path
+    segments so e.g. ``gpt`` never matches ``gpt2``.
+    """
     if model_key in overrides:
         return overrides[model_key]
-    # Try prefix matching (e.g. "qwen" matches "lmstudio/qwen/...")
+
+    model_parts = model_key.split("/")
+    best_key: str | None = None
+    best_len = -1
     for key in overrides:
         if key.startswith("__default"):
             continue
-        if "/" in model_key and any(part in model_key for part in key.split("/")):
-            return overrides[key]
+        key_parts = key.split("/")
+        is_prefix = len(key_parts) <= len(model_parts) and all(
+            k == m for k, m in zip(key_parts, model_parts)
+        )
+        is_contained = all(k in model_parts for k in key_parts)
+        if (is_prefix or is_contained) and len(key_parts) > best_len:
+            best_key, best_len = key, len(key_parts)
+
+    if best_key is not None:
+        return overrides[best_key]
     return overrides.get("__default", _DEFAULT_PRICING)
 
 
@@ -170,7 +187,8 @@ def scan_opencode_db(
     """Scan opencode SQLite database and track token usage.
 
     Reads actual ``tokens.input`` / ``tokens.output`` from the ``message`` table.
-    Applies pricing from *pricing_file*, then ``_KNOWN_MODELS``, then defaults.
+    Applies pricing from *pricing_file* (with whole-segment fallback matching),
+    then ``_DEFAULT_PRICING``.
     """
     import sqlite3
 

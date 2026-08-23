@@ -1,5 +1,9 @@
 # General Workflow of Interaction
 
+> Status: This is a historical snapshot of the development process for `token_tracker`.
+> It documents *how* changes were made, not the tool's current behavior — see `setup.md`
+> for the current spec and `README.md` for usage.
+
 ## Pattern: Iterative Code Development with LSP Feedback
 
 ### 1. Requirement Specification
