@@ -21,23 +21,23 @@ _LOCK_PATH = str(TOKEN_LOG) + ".lock"
 
 _KNOWN_MODELS: dict[str, tuple[float, float]] = {
     # OpenAI defaults
-    "openai/gpt-4o": (2.5, 10.0),
-    "openai/gpt-4o-mini": (0.15, 0.6),
-    "openai/gpt-4": (10.0, 30.0),
-    "openai/gpt-4-turbo": (10.0, 30.0),
-    "openai/o1": (15.0, 60.0),
-    "openai/o3-mini": (1.1, 4.4),
+    "openai/gpt-4o": (0.03, 0.05),
+    "openai/gpt-4o-mini": (0.03, 0.05),
+    "openai/gpt-4": (0.03, 0.05),
+    "openai/gpt-4-turbo": (0.03, 0.05),
+    "openai/o1": (0.03, 0.05),
+    "openai/o3-mini": (0.03, 0.05),
     # Anthropic defaults
-    "anthropic/claude-3.5-sonnet": (3.0, 15.0),
-    "anthropic/claude-3-opus": (15.0, 75.0),
-    "anthropic/claude-3-haiku": (0.25, 1.25),
-    "anthropic/claude-3.7-sonnet": (3.0, 15.0),
+    "anthropic/claude-3.5-sonnet": (0.03, 0.05),
+    "anthropic/claude-3-opus": (0.03, 0.05),
+    "anthropic/claude-3-haiku": (0.03, 0.05),
+    "anthropic/claude-3.7-sonnet": (0.03, 0.05),
     # Google defaults
-    "google/gemini-pro": (0.5, 1.5),
-    "google/gemini-ultra": (2.0, 7.5),
+    "google/gemini-pro": (0.03, 0.05),
+    "google/gemini-ultra": (0.03, 0.05),
 }
 
-_DEFAULT_PRICING: tuple[float, float] = (1.0, 5.0)
+_DEFAULT_PRICING: tuple[float, float] = (0.03, 0.05)
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 {
-    "_default": [1.0, 5.0],
-    "lmstudio_remote/qwen/qwen3.6-35b-a3b": [3.0, 15.0],
-    "lmstudio_remote/google/gemma-4-e4b": [1.0, 5.0]
+    "_default": [0.03, 0.05],
+    "lmstudio_remote/qwen/qwen3.6-35b-a3b": [0.03, 0.05],
+    "lmstudio_remote/google/gemma-4-e2b": [0.03, 0.05]
 }
