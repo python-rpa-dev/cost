@@ -29,6 +29,34 @@ def _fmt(n: float) -> str:
     return f"{int(n):,}".replace(",", "'")
 
 
+def _render_row(cells: tuple[str, ...], widths: list[int], aligns: str) -> str:
+    """Join cells into one line padded to *widths*, aligned per column ('<' or '>')."""
+    return "  ".join(
+        f"{c:>{w}}" if a == ">" else f"{c:<{w}}"
+        for c, w, a in zip(cells, widths, aligns)
+    )
+
+
+def _print_table(
+    headers: tuple[str, ...],
+    rows: list[tuple[str, ...]],
+    aligns: str = "<>>>",
+    rule_before: int | None = None,
+) -> None:
+    """Print aligned columns; *aligns* is one '<'/'>' char per column.
+
+    A separator line is drawn before row index *rule_before* (e.g. the total row).
+    """
+    widths = [max(len(cells[i]) for cells in (headers, *rows)) for i in range(len(headers))]
+    rule = "  ".join("-" * w for w in widths)
+    lines = [_render_row(headers, widths, aligns), rule]
+    for i, row in enumerate(rows):
+        if i == rule_before:
+            lines.append(rule)
+        lines.append(_render_row(row, widths, aligns))
+    print("\n".join(lines))
+
+
 def _safe_read_json(path: Path) -> dict[str, Any] | None:
     """Read a JSON file safely; returns None on failure."""
     try:
@@ -165,16 +193,16 @@ def get_totals() -> dict[str, dict[str, float]]:
     grand_input = 0.0
     grand_output = 0.0
     grand_cost = 0.0
+    rows: list[tuple[str, ...]] = []
     for model, t in totals.items():
-        print(
-            f"{model}: input={_fmt(t['input'])}, output={_fmt(t['output'])}, "
-            f"cost=${t['total_cost']:.2f}"
-        )
+        rows.append((model, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}"))
         grand_input += t["input"]
         grand_output += t["output"]
         grand_cost += t["total_cost"]
 
-    print(f"\nTotal: input={_fmt(grand_input)}, output={_fmt(grand_output)}, cost=${grand_cost:.2f}")
+    rows.append(("Total", _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
+    print()
+    _print_table(("Model", "Input", "Output", "Cost"), rows, "<>>>", rule_before=len(rows) - 1)
     return totals
 
 
@@ -294,23 +322,23 @@ def scan_opencode_db(
         track_tokens(key, t["input"], t["output"])
 
     # Display per-model results
-    for key, t in totals.items():
-        print(
-            f"  {key}: input={_fmt(t['input'])}, output={_fmt(t['output'])}, "
-            f"cost=${t['total_cost']:.2f}"
-        )
+    model_rows: list[tuple[str, ...]] = [
+        (key, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}")
+        for key, t in totals.items()
+    ]
+    model_rows.append(("Total scanned", _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
+    print()
+    _print_table(("Model", "Input", "Output", "Cost"), model_rows, "<>>>", rule_before=len(model_rows) - 1)
 
     # Display monthly breakdown before grand total
     if monthly:
-        print("\nMonthly Breakdown:")
-        for month_key in sorted(by_month.keys()):
-            m = by_month[month_key]
-            print(
-                f"  {month_key}: input={_fmt(m['input'])}, output={_fmt(m['output'])}, "
-                f"cost=${m['cost']:.2f}"
-            )
-
-    print(f"\nTotal scanned: input={_fmt(grand_input)}, output={_fmt(grand_output)}, cost=${grand_cost:.2f}")
+        month_rows = [
+            (month_key, _fmt(m["input"]), _fmt(m["output"]), f"${m['cost']:.2f}")
+            for month_key, m in sorted(by_month.items())
+        ]
+        if month_rows:
+            print("\nMonthly Breakdown:")
+            _print_table(("Month", "Input", "Output", "Cost"), month_rows)
 
     # Date range info
     if min_time is not None and max_time is not None:
