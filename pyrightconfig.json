@@ -1,0 +1,6 @@
+{
+  "venvPath": ".",
+  "venv": ".venv-linux",
+  "include": ["token_tracker.py", "tests"],
+  "exclude": ["**/__pycache__", ".venv-linux", ".venv-windows"]
+}

@@ -5,12 +5,14 @@ Track LLM token usage per model with cost estimation. Supports reading from the 
 ## Quick Start
 
 ```bash
-# Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-source .venv/bin/activate       # macOS/Linux
+# Easiest: the start script creates the per-OS venv and installs deps on first run
+./start.sh              # Linux/macOS  -> .venv-linux
+start.cmd               # Windows      -> .venv-windows
 
-# Install dependencies
+# Or manually:
+python -m venv .venv-linux             # or .venv-windows on Windows
+.venv-windows\Scripts\activate         # Windows
+source .venv-linux/bin/activate        # macOS/Linux
 pip install -e ".[dev]"
 
 # Run

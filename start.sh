@@ -2,9 +2,16 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-if [ ! -x .venv/bin/token-tracker ]; then
-    echo "No venv found. Run: python3 -m venv .venv && make install" >&2
-    exit 1
+VENV=.venv-linux
+
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv "$VENV"
 fi
 
-exec .venv/bin/token-tracker "$@"
+if ! "$VENV/bin/python" -c "import token_tracker, filelock" >/dev/null 2>&1; then
+    echo "Installing dependencies..."
+    "$VENV/bin/python" -m pip install --quiet -e ".[dev]" vulture
+fi
+
+exec "$VENV/bin/token-tracker" "$@"

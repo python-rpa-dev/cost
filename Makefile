@@ -1,4 +1,4 @@
-PY = .venv/bin/python
+PY = .venv-linux/bin/python
 
 .PHONY: install test lint check
 
@@ -9,7 +9,7 @@ test:
 	$(PY) -m pytest
 
 lint:
-	.venv/bin/ruff check .
-	.venv/bin/vulture
+	.venv-linux/bin/ruff check .
+	.venv-linux/bin/vulture
 
 check: lint test

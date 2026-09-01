@@ -1,5 +1,5 @@
-# Virtual environment
-.venv/
+# Virtual environment (per-OS: .venv-linux / .venv-windows)
+.venv*/
 venv/
 env/
 
