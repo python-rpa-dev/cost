@@ -36,6 +36,7 @@ known-first-party = ["token_tracker"]
 paths = ["token_tracker.py"]
 min_confidence = 60
 verbose = true
+ignore_names = ["input_price_per_m", "output_price_per_m"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
