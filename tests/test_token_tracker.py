@@ -18,6 +18,7 @@ from token_tracker import (
     clear_log,
     get_totals,
     main,
+    scan_all,
     scan_opencode_db,
     scan_pi,
     track_tokens,
@@ -265,16 +266,16 @@ class TestParseCliArgs:
 
     def test_scan_with_flags(self):
         args = _parse_cli_args(
-            ["token_tracker.py", "scan", "--pricing-file", "p.json", "--obfuscate", "--no-monthly"]
+            ["token_tracker.py", "scan-oc", "--pricing-file", "p.json", "--obfuscate", "--no-monthly"]
         )
-        assert args["command"] == "scan"
+        assert args["command"] == "scan-oc"
         assert args["pricing_file"] == "p.json"
         assert args["obfuscate"] is True
         assert args["monthly"] is False
 
     def test_db_path_flag(self):
-        args = _parse_cli_args(["token_tracker.py", "scan", "--db-path", "/tmp/x.db"])
-        assert args["command"] == "scan"
+        args = _parse_cli_args(["token_tracker.py", "scan-oc", "--db-path", "/tmp/x.db"])
+        assert args["command"] == "scan-oc"
         assert args["db_path"] == "/tmp/x.db"
 
     def test_scan_pi_flags(self):
@@ -285,15 +286,24 @@ class TestParseCliArgs:
         assert args["sessions_dir"] == "/tmp/s"
         assert args["obfuscate"] is True
 
+    def test_scan_all_command(self):
+        args = _parse_cli_args(["token_tracker.py", "scan-all"])
+        assert args["command"] == "scan-all"
+
     def test_invalid_command_raises(self):
         with pytest.raises(SystemExit):
             _parse_cli_args(["token_tracker.py", "bogus"])
 
 
 class TestMainDispatch:
-    def test_dispatch_scan(self, capsys):
+    def test_dispatch_scan_oc(self, capsys):
         with patch("token_tracker.scan_opencode_db") as m:
-            main(["token_tracker.py", "scan"])
+            main(["token_tracker.py", "scan-oc"])
+        m.assert_called_once()
+
+    def test_dispatch_scan_all(self, capsys):
+        with patch("token_tracker.scan_all") as m:
+            main(["token_tracker.py", "scan-all"])
         m.assert_called_once()
 
     def test_dispatch_totals_default(self, capsys):
@@ -487,3 +497,49 @@ class TestScanPi:
         self._scan(tmp_path, root, monthly=False)
         data = json.loads((tmp_path / "token_log.json").read_text())
         assert data["prov/mdl"] == {"input": 700, "output": 300}
+
+
+class TestScanAll:
+    def _scan_all(self, tmp_path, **kw):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            return scan_all(**kw)
+
+    def test_combines_sources_with_source_column(self, tmp_path, capsys):
+        db = _make_db(
+            tmp_path,
+            [{"providerID": "p", "id": "m", "tokens": {"input": 1000, "output": 500}}],
+        )
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("prov", "mdl", 700, 300)])
+        result = self._scan_all(
+            tmp_path, db_path=str(db), sessions_dir=str(root), monthly=False
+        )
+        assert ("opencode", "p/m") in result
+        assert ("oh-my-pi", "prov/mdl") in result
+        assert "Source" in capsys.readouterr().out
+        # Ledger persists per model; sources merge under the plain model key.
+        data = json.loads((tmp_path / "token_log.json").read_text())
+        assert data["p/m"]["input"] == 1000
+        assert data["prov/mdl"]["output"] == 300
+
+    def test_single_source_still_reports(self, tmp_path, capsys):
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("prov", "mdl", 700, 300)])
+        result = self._scan_all(
+            tmp_path,
+            db_path=str(tmp_path / "missing.db"),
+            sessions_dir=str(root),
+            monthly=False,
+        )
+        assert list(result) == [("oh-my-pi", "prov/mdl")]
+        assert "No opencode database found." in capsys.readouterr().out
+
+    def test_no_sources(self, tmp_path, capsys):
+        result = self._scan_all(
+            tmp_path,
+            db_path=str(tmp_path / "missing.db"),
+            sessions_dir=str(tmp_path / "none"),
+            monthly=False,
+        )
+        assert result == {}
+        assert "No data sources found." in capsys.readouterr().out

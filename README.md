@@ -5,9 +5,9 @@ Track LLM token usage per model with cost estimation. Reads real reported usage 
 ## Quick Start
 
 ```bash
-# Easiest: the start script creates the per-OS venv and installs deps on first run
-./start.sh              # Linux/macOS  -> .venv-linux
-start.cmd               # Windows      -> .venv-windows
+# Easiest: the launcher script creates the per-OS venv and installs deps on first run
+./token_tracker.sh          # Linux/macOS  -> .venv-linux
+token_tracker.cmd           # Windows      -> .venv-windows
 
 # Or manually:
 python -m venv .venv-linux             # or .venv-windows on Windows
@@ -24,17 +24,17 @@ python token_tracker.py
 | Command | Description |
 |---------|-------------|
 | `python token_tracker.py [totals] [--pricing-file <path>]` | Print per-model totals (input/output tokens + cost) |
-| `python token_tracker.py scan [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
+| `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
 | `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
+| `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan all client sources; one table with a Source column |
 | `python token_tracker.py pricing` | Describe how pricing is configured and show the default fallback |
 | `python token_tracker.py clear` | Clear the token log file |
 
 ### Options
 
-- `--db-path <path>` — Scan an explicit opencode.db file (default: auto-detect)
-- `--sessions-dir <path>` — Directory of pi session logs for `scan-pi` (default: `~/.omp/agent/sessions`)
-- `--pricing-file <path>` — Use an external JSON file for pricing overrides (applies to `totals`, `scan`, and `scan-pi`)
-- `--obfuscate` — Truncate the scanned data path in output to the last 25 characters
+- `--db-path <path>` — Scan an explicit opencode.db file (`scan-oc`/`scan-all`; default: auto-detect)
+- `--sessions-dir <path>` — Directory of pi session logs (`scan-pi`/`scan-all`; default: `~/.omp/agent/sessions`)
+- `--pricing-file <path>` — Use an external JSON file for pricing overrides (applies to `totals`, `scan-oc`, `scan-pi`, and `scan-all`)
 - `--no-monthly` — Suppress the monthly cost breakdown
 
 > A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan`.

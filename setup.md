@@ -15,10 +15,13 @@ Print per-model and aggregate input/output token totals, plus cost as an aligned
 ### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
 Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing via whole-segment matching against `--pricing-file` entries, falling back to the file's `_default` key and then `_DEFAULT_PRICING`. When `obfuscate=True`, the DB path in output is truncated to the last 25 characters.
 
-Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the model table (grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line.
+Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the usage table with a leading `Source` column (`Source / Model / Input / Output / Cost`; grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line.
 
 ### `scan_pi(sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
 Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently.
+
+### `scan_all(db_path: str | None = None, sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
+Scan every known client source (opencode DB + oh-my-pi session logs) and render one combined table with a Source column. Missing sources are reported and skipped. Returns totals keyed by `(source, model)`; the ledger persists per model (sources merged).
 
 ### `clear_log()`
 Remove the token log file.
@@ -32,8 +35,9 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 ## CLI
 
 - `python token_tracker.py` — print totals
-- `python token_tracker.py scan [--pricing-file <path>] [--obfuscate]` — scan opencode SQLite database (primary)
+- `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate]` — scan opencode SQLite database (primary)
 - `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate]` — scan oh-my-pi session logs
+- `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path> ...]` — scan all client sources; combined Source-tagged table
 - `python token_tracker.py pricing` — list all available pricing options
 - `python token_tracker.py clear` — clear the log
 

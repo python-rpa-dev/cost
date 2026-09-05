@@ -10,16 +10,16 @@ CLI (`token-tracker`) that tracks LLM token usage and cost across client harness
 - Python >=3.9 (ruff target py39), single-module package built with setuptools; console script `token-tracker = token_tracker:main`.
 - Runtime deps: exactly one — `filelock>=3.0`. Everything else is stdlib (`sqlite3`, `json`, `argparse`, `datetime`).
 - Dev: pytest + pytest-cov (coverage in addopts), ruff (E,F,W,I,N,UP,B,SIM,RUF; E501 ignored), pyright, vulture (paths include tests so public API used by them counts as live; ignore_names covers only TypedDict members read via subscript).
-- Dual-OS repo by design: `.venv-windows`/`.venv-linux`, `start.cmd`/`start.sh`, venv-pinned Makefile targets (WSL2 + Windows workflow).
+- Dual-OS repo by design: `.venv-windows`/`.venv-linux`, `token_tracker.cmd`/`token_tracker.sh` (self-healing launchers), venv-pinned Makefile targets (WSL2 + Windows workflow).
 
 ## ARCHITECTURE
 Flat single module `token_tracker.py` with banner-separated regions: Helpers -> Public API -> CLI entry point. Tests mirror it 1:1 in `tests/test_token_tracker.py`.
 
-Shared core (the client-plugin seam): scanners normalize their source into `UsageRecord(key, input_tokens, output_tokens, ts)` tuples; `_aggregate(records, overrides)` sums them into `TotalsEntry` totals + monthly buckets + time span; `_track_batch`, `_print_model_table`, `_print_monthly`, `_print_date_range` render and persist identically for every client.
+Shared core (the client-plugin seam): scanners normalize their source into `UsageRecord(key, input_tokens, output_tokens, ts, source)` tuples; `_aggregate(records, overrides)` sums them per `(source, model)` into `TotalsEntry` totals + monthly buckets + time span; `_scan_report(records, overrides, monthly)` then persists via `_track_batch` (per model — sources merged in the ledger) and renders the Source-column table (`Source / Model / Input / Output / Cost`, grand-total row `Total scanned`) plus `_print_monthly`/`_print_date_range`. `get_totals` keeps the plain 4-column model table.
 
 - `scan_opencode_db`: resolve DB path (explicit or XDG/AppData/cwd candidates) -> read-only sqlite URI (`mode=ro`) -> parse `message.data` JSON rows -> records keyed `provider/model_id[/variant]`.
 - `scan_pi`: walk `~/.omp/agent/sessions/**/*.jsonl` (one dir per working directory, `<ts>_<uuid>.jsonl`) -> assistant-message lines only -> records keyed `provider/model`; pi's own cost fields ignored (zero for local models), cache read/write counts deliberately excluded.
-- CLI: `totals | scan | scan-pi | clear | pricing`, flags `--pricing-file --obfuscate --no-monthly --db-path --sessions-dir`.
+- CLI: `totals | scan-oc | scan-pi | scan-all | clear | pricing`, flags `--pricing-file --obfuscate --no-monthly --db-path --sessions-dir`; `scan-all` composes both collectors into one Source-tagged report and returns totals keyed `(source, model)`.
 
 Storage: `token_log.json` (gitignored) is the append-only cumulative ledger; `pricing.json` supplies per-model overrides merged over `_DEFAULT_PRICING = (0.03, 0.05)` USD per million tokens.
 
@@ -35,9 +35,9 @@ Storage: `token_log.json` (gitignored) is the append-only cumulative ledger; `pr
 ## TRADEOFFS
 - Single module vs package split: accepted for a small CLI; cost is fan-in concentration on `_get_pricing` (highest in graph) — any signature change there needs full reference check.
 - Exact usage only: the legacy `scan-json`/`estimate_tokens` path (~1.3 tok/word text estimation) was deleted once oh-my-pi logs provided exact counts; no scanner may persist estimates (setup.md requirement).
-- No client registry yet: two scanners share the core via direct calls; a `{name: scan_fn}` dispatch table appears only when a third client lands (no premature abstraction).
+- No client registry yet: the two scanners share the core via direct calls and `scan_all` composes their collectors; a `{name: scan_fn}` dispatch table appears only when a third client lands (no premature abstraction).
 - JSON ledger instead of SQLite for own log: human-readable and trivially diffable; pays for it with FileLock because there is no transactionality.
-- Per-OS venv dirs instead of one cross-platform env: duplication buys self-healing start scripts on both Windows and WSL2.
+- Per-OS venv dirs instead of one cross-platform env: duplication buys self-healing launcher scripts on both Windows and WSL2.
 
 ## PHILOSOPHY
 Zero heavy dependencies; never mutate data you do not own; degrade gracefully rather than crash on foreign input; atomic-or-nothing for anything persisted; exact counts over estimates; explicit types over tool inference. PowerShell-first shell habits (no `&&`; no Python here-strings) per AGENTS.md — Windows is a first-class host.

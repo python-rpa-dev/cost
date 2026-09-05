@@ -40,13 +40,15 @@ class TotalsEntry(TypedDict):
 class UsageRecord(NamedTuple):
     """One usage observation from any client harness.
 
-    ``ts`` is epoch seconds (already normalized from ms) or ``None``.
+    ``ts`` is epoch seconds (already normalized from ms) or ``None``;
+    ``source`` names the client ("opencode", "oh-my-pi").
     """
 
     key: str
     input_tokens: float
     output_tokens: float
     ts: float | None
+    source: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +206,14 @@ def _priced(input_tokens: float, output_tokens: float, price: PricePair) -> Tota
 
 def _aggregate(
     records: Iterable[UsageRecord], overrides: dict[str, PricePair]
-) -> tuple[dict[str, TotalsEntry], dict[str, dict[str, float]], float | None, float | None]:
-    """Sum usage records into per-model totals plus monthly buckets.
+) -> tuple[dict[tuple[str, str], TotalsEntry], dict[str, dict[str, float]], float | None, float | None]:
+    """Sum usage records into per-(source, model) totals plus monthly buckets.
 
     Shared core for every client scanner. Records with zero input *and* output
     are skipped. Returns ``(totals, by_month, min_ts, max_ts)`` where
     ``by_month`` maps ``"YYYY-MM"`` (UTC) to summed usage and cost.
     """
-    sums: dict[str, list[float]] = {}
+    sums: dict[tuple[str, str], list[float]] = {}
     price_cache: dict[str, PricePair] = {}
     by_month: dict[str, dict[str, float]] = {}
     min_ts: float | None = None
@@ -221,10 +223,11 @@ def _aggregate(
         if rec.input_tokens == 0 and rec.output_tokens == 0:
             continue
 
-        if rec.key not in sums:
-            sums[rec.key] = [0.0, 0.0]
-            price_cache[rec.key] = _get_pricing(rec.key, overrides)
-        acc = sums[rec.key]
+        ident = (rec.source, rec.key)
+        if ident not in sums:
+            sums[ident] = [0.0, 0.0]
+        price_cache.setdefault(rec.key, _get_pricing(rec.key, overrides))
+        acc = sums[ident]
         acc[0] += rec.input_tokens
         acc[1] += rec.output_tokens
 
@@ -244,8 +247,50 @@ def _aggregate(
                 rec.output_tokens, price[1]
             )
 
-    totals = {key: _priced(acc[0], acc[1], price_cache[key]) for key, acc in sums.items()}
+    totals = {ident: _priced(acc[0], acc[1], price_cache[key]) for ident, acc in sums.items() for key in (ident[1],)}
     return totals, by_month, min_ts, max_ts
+
+
+def _scan_report(
+    records: list[UsageRecord], overrides: dict[str, PricePair], monthly: bool
+) -> dict[tuple[str, str], TotalsEntry]:
+    """Aggregate, persist, and render one scan; totals keyed by ``(source, model)``.
+
+    The ledger is persisted per model (sources merged); the table carries a
+    Source column so combined scans stay attributable.
+    """
+    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
+
+    # Persist in a single locked read-modify-write, merging sources per model.
+    batch: dict[str, PricePair] = {}
+    for (_src, model), t in totals.items():
+        if model in batch:
+            prev = batch[model]
+            batch[model] = (prev[0] + t["input"], prev[1] + t["output"])
+        else:
+            batch[model] = (t["input"], t["output"])
+    _track_batch(batch)
+
+    rows: list[tuple[str, ...]] = [
+        (src, model, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}")
+        for (src, model), t in totals.items()
+    ]
+    grand_input = sum(t["input"] for t in totals.values())
+    grand_output = sum(t["output"] for t in totals.values())
+    grand_cost = sum(t["total_cost"] for t in totals.values())
+    rows.append(("Total scanned", "", _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
+    print()
+    _print_table(
+        ("Source", "Model", "Input", "Output", "Cost"),
+        rows,
+        "<<>>>",
+        rule_before=len(rows) - 1,
+    )
+
+    if monthly:
+        _print_monthly(by_month)
+    _print_date_range(min_ts, max_ts)
+    return totals
 
 
 def _print_model_table(totals: dict[str, TotalsEntry], total_label: str = "Total") -> None:
@@ -317,7 +362,7 @@ def track_tokens(model: str, input_tokens: float, output_tokens: float) -> None:
 def get_totals(pricing_file: str | None = None) -> dict[str, TotalsEntry]:
     """Read and display all tracked token usage with costs.
 
-    *pricing_file* applies the same overrides used by ``scan``.
+    *pricing_file* applies the same overrides used by the scanners.
     """
     log = _safe_read_json(TOKEN_LOG)
     if not log:
@@ -368,7 +413,37 @@ def _opencode_record(data_text: Any, time_created: Any) -> UsageRecord | None:
         tokens.get("input", 0) or 0,
         tokens.get("output", 0) or 0,
         _to_epoch_seconds(time_created),
+        "opencode",
     )
+
+
+def _collect_opencode(db_path: str | None, obfuscate: bool) -> list[UsageRecord] | None:
+    """Gather usage records from the opencode DB; None if no source is present."""
+    db = _resolve_db_path(db_path)
+    if db is None:
+        print("No opencode database found.")
+        return None
+
+    display_path = "..." + str(db)[-25:] if obfuscate else str(db)
+
+    # Open read-only so a scan can never lock or modify a live opencode.db.
+    conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    records: list[UsageRecord] = []
+    raw_count = 0
+    try:
+        for data_text, time_created in conn.execute("SELECT data, time_created FROM message"):
+            raw_count += 1
+            record = _opencode_record(data_text, time_created)
+            if record is not None:
+                records.append(record)
+    except sqlite3.OperationalError as exc:
+        print(f"Could not read the opencode database: {exc}")
+        return None
+    finally:
+        conn.close()
+
+    print(f"Scanning {raw_count} messages from {display_path}...")
+    return records
 
 
 def scan_opencode_db(
@@ -383,50 +458,13 @@ def scan_opencode_db(
     Applies pricing from *pricing_file* (with whole-segment fallback matching),
     then ``_DEFAULT_PRICING``.
     """
-    db = _resolve_db_path(db_path)
-    if db is None:
-        print("No opencode database found.")
+    records = _collect_opencode(db_path, obfuscate)
+    if records is None:
         return {}
 
-    display_path = "..." + str(db)[-25:] if obfuscate else str(db)
-
-    # Load pricing
     overrides = _load_pricing_overrides(pricing_file)
-
-    # Open read-only so a scan can never lock or modify a live opencode.db.
-    conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
-    records: list[UsageRecord] = []
-    raw_count = 0
-    try:
-        for data_text, time_created in conn.execute("SELECT data, time_created FROM message"):
-            raw_count += 1
-            record = _opencode_record(data_text, time_created)
-            if record is not None:
-                records.append(record)
-    except sqlite3.OperationalError as exc:
-        print(f"Could not read the opencode database: {exc}")
-        return {}
-    finally:
-        conn.close()
-
-    print(f"Scanning {raw_count} messages from {display_path}...")
-
-    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
-
-    # Persist all models in a single locked read-modify-write.
-    _track_batch({key: (t["input"], t["output"]) for key, t in totals.items()})
-
-    # Display per-model results
-    _print_model_table(totals, total_label="Total scanned")
-
-    # Display monthly breakdown before grand total
-    if monthly:
-        _print_monthly(by_month)
-
-    # Date range info
-    _print_date_range(min_ts, max_ts)
-
-    return totals
+    totals = _scan_report(records, overrides, monthly)
+    return {model: t for (_src, model), t in totals.items()}
 
 
 def _pi_record(line: str) -> UsageRecord | None:
@@ -458,31 +496,19 @@ def _pi_record(line: str) -> UsageRecord | None:
         usage.get("input", 0) or 0,
         usage.get("output", 0) or 0,
         _to_epoch_seconds(msg.get("timestamp")),
+        "oh-my-pi",
     )
 
 
-def scan_pi(
-    sessions_dir: str | None = None,
-    pricing_file: str | None = None,
-    obfuscate: bool = False,
-    monthly: bool = True,
-) -> dict[str, TotalsEntry]:
-    """Scan oh-my-pi session logs and track token usage.
-
-    Reads exact ``usage.input`` / ``usage.output`` from assistant messages in
-    the JSONL transcripts under *sessions_dir* (default ``~/.omp/agent/sessions``,
-    one subdirectory per working directory, ``<ts>_<uuid>.jsonl`` files). Model
-    keys are ``provider/model``, matching the shared pricing-key scheme.
-    """
+def _collect_pi(sessions_dir: str | None, obfuscate: bool) -> list[UsageRecord] | None:
+    """Gather usage records from pi session logs; None if no source is present."""
     root = Path(sessions_dir) if sessions_dir else Path.home() / ".omp" / "agent" / "sessions"
     display = "..." + str(root)[-25:] if obfuscate else str(root)
 
     files = sorted(root.rglob("*.jsonl")) if root.is_dir() else []
     if not files:
         print(f"No pi sessions found in {display}.")
-        return {}
-
-    overrides = _load_pricing_overrides(pricing_file)
+        return None
 
     records: list[UsageRecord] = []
     raw_count = 0
@@ -498,20 +524,62 @@ def scan_pi(
             print(f"Warning: skipping {path}")
 
     print(f"Scanning {len(files)} session files, {raw_count} lines from {display}...")
+    return records
 
-    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
 
-    # Persist all models in a single locked read-modify-write.
-    _track_batch({key: (t["input"], t["output"]) for key, t in totals.items()})
+def scan_pi(
+    sessions_dir: str | None = None,
+    pricing_file: str | None = None,
+    obfuscate: bool = False,
+    monthly: bool = True,
+) -> dict[str, TotalsEntry]:
+    """Scan oh-my-pi session logs and track token usage.
 
-    _print_model_table(totals, total_label="Total scanned")
+    Reads exact ``usage.input`` / ``usage.output`` from assistant messages in
+    the JSONL transcripts under *sessions_dir* (default ``~/.omp/agent/sessions``,
+    one subdirectory per working directory, ``<ts>_<uuid>.jsonl`` files). Model
+    keys are ``provider/model``, matching the shared pricing-key scheme.
+    """
+    records = _collect_pi(sessions_dir, obfuscate)
+    if records is None:
+        return {}
 
-    if monthly:
-        _print_monthly(by_month)
+    overrides = _load_pricing_overrides(pricing_file)
+    totals = _scan_report(records, overrides, monthly)
+    return {model: t for (_src, model), t in totals.items()}
 
-    _print_date_range(min_ts, max_ts)
 
-    return totals
+def scan_all(
+    db_path: str | None = None,
+    sessions_dir: str | None = None,
+    pricing_file: str | None = None,
+    obfuscate: bool = False,
+    monthly: bool = True,
+) -> dict[tuple[str, str], TotalsEntry]:
+    """Scan every known client source and report usage in one Source-tagged table.
+
+    Combines the opencode DB and oh-my-pi session logs; missing sources are
+    reported and skipped. Returns totals keyed by ``(source, model)``; the
+    ledger is persisted per model (sources merged).
+    """
+    records: list[UsageRecord] = []
+    found = False
+
+    oc_records = _collect_opencode(db_path, obfuscate)
+    if oc_records is not None:
+        records.extend(oc_records)
+        found = True
+    pi_records = _collect_pi(sessions_dir, obfuscate)
+    if pi_records is not None:
+        records.extend(pi_records)
+        found = True
+
+    if not found:
+        print("No data sources found.")
+        return {}
+
+    overrides = _load_pricing_overrides(pricing_file)
+    return _scan_report(records, overrides, monthly)
 
 
 def clear_log() -> None:
@@ -538,18 +606,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="totals",
-        choices=["totals", "scan", "scan-pi", "clear", "pricing"],
+        choices=["totals", "scan-oc", "scan-pi", "scan-all", "clear", "pricing"],
         help="Command to run (default: totals)",
     )
     parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
     parser.add_argument("--obfuscate", action="store_true", help="Truncate the data path in output")
     parser.add_argument("--no-monthly", action="store_true", help="Suppress the monthly breakdown")
-    parser.add_argument("--db-path", metavar="PATH", default=None, help="Explicit path to an opencode.db file (scan)")
+    parser.add_argument("--db-path", metavar="PATH", default=None, help="Explicit path to an opencode.db file (scan-oc/scan-all)")
     parser.add_argument(
         "--sessions-dir",
         metavar="PATH",
         default=None,
-        help="Directory of pi session logs (default: ~/.omp/agent/sessions)",
+        help="Directory of pi session logs for scan-pi/scan-all (default: ~/.omp/agent/sessions)",
     )
     return parser
 
@@ -575,7 +643,7 @@ def main(argv: list[str] | None = None) -> None:
     parsed = _parse_cli_args(argv)
     cmd = parsed["command"]
 
-    if cmd == "scan":
+    if cmd == "scan-oc":
         scan_opencode_db(
             db_path=parsed.get("db_path"),
             pricing_file=parsed.get("pricing_file"),
@@ -584,6 +652,14 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif cmd == "scan-pi":
         scan_pi(
+            sessions_dir=parsed.get("sessions_dir"),
+            pricing_file=parsed.get("pricing_file"),
+            obfuscate=parsed.get("obfuscate", False),
+            monthly=parsed.get("monthly", True),
+        )
+    elif cmd == "scan-all":
+        scan_all(
+            db_path=parsed.get("db_path"),
             sessions_dir=parsed.get("sessions_dir"),
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
