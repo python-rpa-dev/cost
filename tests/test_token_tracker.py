@@ -721,3 +721,58 @@ class TestEnvTagging:
     def test_env_cli_flag(self):
         args = _parse_cli_args(["token_tracker.py", "scan-all", "--env", "desktop"])
         assert args["env"] == "desktop"
+
+
+class TestLedgerMonthly:
+    """The default command must show cumulative monthly totals from the ledger."""
+
+    JAN = 1_672_531_200  # 2023-01-01T00:00Z
+    APR = 1_680_307_200  # 2023-04-01T00:00Z
+
+    def _scan(self, tmp_path, db, **kw):
+        log = tmp_path / "data" / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            return scan_opencode_db(db_path=str(db), env="t", **kw)
+
+    def test_totals_prints_monthly_breakdown(self, tmp_path, capsys):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 1_000_000, "output": 500_000}}
+        db = _make_db(tmp_path, [row, dict(row)], timestamps=[self.JAN, self.APR])
+        self._scan(tmp_path, db)
+        capsys.readouterr()  # drop scan-time output; assert on the totals command only
+
+        log = tmp_path / "data" / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log):
+            get_totals()
+        out = capsys.readouterr().out
+        assert "Monthly Breakdown:" in out
+        jan_line = next(line for line in out.splitlines() if line.startswith("2023-01"))
+        apr_line = next(line for line in out.splitlines() if line.startswith("2023-04"))
+        # Default pricing: 1M in -> $0.03, 0.5M out -> $0.025 per month.
+        assert "1'000'000" in jan_line and "$0.06" in jan_line
+        assert "1'000'000" in apr_line and "$0.06" in apr_line
+
+    def test_months_accumulate_across_scans(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}
+        db = _make_db(tmp_path, [row], timestamps=[self.JAN])
+        self._scan(tmp_path, db)
+
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO message (data, time_created) VALUES (?, ?)", (json.dumps(row), self.APR)
+        )
+        conn.commit()
+        conn.close()
+        self._scan(tmp_path, db)  # only the April row is new; January bucket untouched
+
+        data = json.loads((tmp_path / "data" / "token_log.json").read_text())
+        assert data["_meta"]["months"]["2023-01"]["p/m"] == [100, 5]
+        assert data["_meta"]["months"]["2023-04"]["p/m"] == [100, 5]
+
+    def test_totals_without_months_unchanged(self, tmp_path, capsys):
+        log = tmp_path / "token_log.json"
+        log.write_text('{"p/m": {"input": 10, "output": 1}}')
+        with patch("token_tracker.TOKEN_LOG", log):
+            get_totals()
+        assert "Monthly Breakdown:" not in capsys.readouterr().out

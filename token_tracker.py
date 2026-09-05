@@ -310,6 +310,9 @@ def _scan_report(
                     prev = marks.get(src)
                     if not isinstance(prev, (int, float)) or isinstance(prev, bool) or ts > prev:
                         marks[src] = ts
+                buckets = meta.setdefault("months", {})
+                if isinstance(buckets, dict):
+                    _accumulate_months(buckets, fresh)
                 _write_log(log)
             else:
                 print("Warning: ledger _meta is malformed; usage tracked without watermark.")
@@ -431,6 +434,25 @@ def _tag_env(records: list[UsageRecord], env: str) -> list[UsageRecord]:
     return [rec._replace(source=f"{rec.source}@{env}") for rec in records]
 
 
+def _accumulate_months(buckets: dict[str, Any], records: list[UsageRecord]) -> None:
+    """Accumulate raw per-month/per-model tokens into the ledger's ``_meta.months``.
+
+    Buckets hold unpriced token counts (``month -> model -> [input, output]``);
+    costs are computed at display time so price changes reprice history.
+    Undated and zero-usage records are not bucketed.
+    """
+    for rec in records:
+        if rec.ts is None or (rec.input_tokens == 0 and rec.output_tokens == 0):
+            continue
+        month_key = datetime.fromtimestamp(rec.ts, tz=timezone.utc).strftime("%Y-%m")
+        entry = buckets.setdefault(month_key, {})
+        if not isinstance(entry, dict):
+            continue
+        prev = entry.get(rec.key)
+        pair = prev if isinstance(prev, list) and len(prev) == 2 else [0, 0]
+        entry[rec.key] = [pair[0] + rec.input_tokens, pair[1] + rec.output_tokens]
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -455,10 +477,43 @@ def track_tokens(model: str, input_tokens: float, output_tokens: float) -> None:
     _track_batch({model: (input_tokens, output_tokens)})
 
 
+def _monthly_from_ledger(
+    log: dict[str, Any], overrides: dict[str, PricePair]
+) -> dict[str, dict[str, float]]:
+    """Reprice the ledger's stored month buckets with current pricing."""
+    meta = log.get("_meta")
+    months = meta.get("months") if isinstance(meta, dict) else None
+    if not isinstance(months, dict):
+        return {}
+
+    by_month: dict[str, dict[str, float]] = {}
+    for month_key in sorted(months):
+        per_model = months[month_key]
+        if not isinstance(per_model, dict):
+            continue
+        bucket = {"input": 0.0, "output": 0.0, "cost": 0.0}
+        for model_key, pair in per_model.items():
+            if not (isinstance(pair, list) and len(pair) == 2):
+                continue
+            try:
+                input_tokens = float(pair[0])
+                output_tokens = float(pair[1])
+            except (TypeError, ValueError):
+                continue
+            t = _priced(input_tokens, output_tokens, _get_pricing(model_key, overrides))
+            bucket["input"] += input_tokens
+            bucket["output"] += output_tokens
+            bucket["cost"] += t["total_cost"]
+        by_month[str(month_key)] = bucket
+    return by_month
+
+
 def get_totals(pricing_file: str | None = None) -> dict[str, TotalsEntry]:
     """Read and display all tracked token usage with costs.
 
-    *pricing_file* applies the same overrides used by the scanners.
+    *pricing_file* applies the same overrides used by the scanners. When the
+    ledger carries month buckets (written by scans), a cumulative monthly
+    breakdown is printed below the model table.
     """
     log = _safe_read_json(TOKEN_LOG)
     if not log:
@@ -475,6 +530,9 @@ def get_totals(pricing_file: str | None = None) -> dict[str, TotalsEntry]:
     }
 
     _print_model_table(totals)
+    by_month = _monthly_from_ledger(log, overrides)
+    if by_month:
+        _print_monthly(by_month)
     return totals
 
 

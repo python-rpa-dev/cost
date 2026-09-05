@@ -23,7 +23,7 @@ python token_tracker.py
 
 | Command | Description |
 |---------|-------------|
-| `python token_tracker.py [totals] [--pricing-file <path>]` | Print per-model totals (input/output tokens + cost) |
+| `python token_tracker.py [totals] [--pricing-file <path>]` | Print per-model totals (input/output tokens + cost) and the cumulative monthly breakdown |
 | `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
 | `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
 | `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan all client sources; one table with a Source column |
