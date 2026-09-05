@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import json
 import sqlite3
 import sys
@@ -14,7 +15,7 @@ from typing import Any, NamedTuple, TypedDict
 
 from filelock import FileLock
 
-TOKEN_LOG = Path("token_log.json")
+TOKEN_LOG = Path("data") / "token_log.json"
 _LOCK_PATH = str(TOKEN_LOG) + ".lock"
 
 
@@ -252,24 +253,72 @@ def _aggregate(
 
 
 def _scan_report(
-    records: list[UsageRecord], overrides: dict[str, PricePair], monthly: bool
+    records: list[UsageRecord],
+    overrides: dict[str, PricePair],
+    monthly: bool,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
 ) -> dict[tuple[str, str], TotalsEntry]:
     """Aggregate, persist, and render one scan; totals keyed by ``(source, model)``.
+
+    Only records newer than the per-source watermark stored under ``_meta`` in
+    the ledger are tracked, so re-scanning never double-counts; each source's
+    watermark advances to its newest persisted timestamp. Records without a
+    timestamp count once, on the first scan of their source. *since_ts* and
+    *until_ts* restrict tracking to a UTC epoch-seconds window (start
+    inclusive, end exclusive).
 
     The ledger is persisted per model (sources merged); the table carries a
     Source column so combined scans stay attributable.
     """
-    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
+    if since_ts is not None or until_ts is not None:
+        records = [r for r in records if _in_window(r.ts, since_ts, until_ts)]
 
-    # Persist in a single locked read-modify-write, merging sources per model.
-    batch: dict[str, PricePair] = {}
-    for (_src, model), t in totals.items():
-        if model in batch:
-            prev = batch[model]
-            batch[model] = (prev[0] + t["input"], prev[1] + t["output"])
-        else:
-            batch[model] = (t["input"], t["output"])
-    _track_batch(batch)
+    _ensure_data_dir()
+    with FileLock(_LOCK_PATH, timeout=10):
+        log = _safe_read_json(TOKEN_LOG) or {}
+        watermarks = _get_watermarks(log)
+
+        fresh: list[UsageRecord] = []
+        skipped: dict[str, int] = {}
+        for rec in records:
+            watermark = watermarks.get(rec.source)
+            if rec.ts is not None and watermark is not None and rec.ts <= watermark:
+                skipped[rec.source] = skipped.get(rec.source, 0) + 1
+            else:
+                fresh.append(rec)
+
+        totals, by_month, min_ts, max_ts = _aggregate(fresh, overrides)
+
+        changed = False
+        for (_src, model), t in totals.items():
+            entry = log.setdefault(model, {"input": 0, "output": 0})
+            if isinstance(entry, dict):
+                entry["input"] += t["input"]
+                entry["output"] += t["output"]
+                changed = True
+        new_marks: dict[str, float] = {}
+        for rec in fresh:
+            if rec.ts is not None:
+                new_marks[rec.source] = max(new_marks.get(rec.source, rec.ts), rec.ts)
+        if changed or new_marks:
+            meta = log.setdefault("_meta", {})
+            marks = meta.setdefault("watermark", {}) if isinstance(meta, dict) else None
+            if isinstance(marks, dict):
+                for src, ts in new_marks.items():
+                    prev = marks.get(src)
+                    if not isinstance(prev, (int, float)) or isinstance(prev, bool) or ts > prev:
+                        marks[src] = ts
+                _write_log(log)
+            else:
+                print("Warning: ledger _meta is malformed; usage tracked without watermark.")
+                _write_log({k: v for k, v in log.items() if k != "_meta"})
+
+    for src, n in sorted(skipped.items()):
+        print(f"Skipped {_fmt(n)} already-tracked record(s) from {src}.")
+    if not fresh:
+        print("No new usage to track.")
+        return {}
 
     rows: list[tuple[str, ...]] = [
         (src, model, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}")
@@ -332,26 +381,58 @@ def _print_date_range(min_ts: float | None, max_ts: float | None) -> None:
     )
 
 
+def _ensure_data_dir() -> None:
+    """Create the directory holding the token log and its lock file."""
+    Path(_LOCK_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _write_log(log: dict[str, Any]) -> None:
+    """Atomically replace the token log file."""
+    TOKEN_LOG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN_LOG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(log, indent=2), encoding="utf-8")
+    tmp.replace(TOKEN_LOG)
+
+
+def _get_watermarks(log: dict[str, Any]) -> dict[str, float]:
+    """Extract per-source watermarks from the ledger's ``_meta`` section."""
+    meta = log.get("_meta")
+    raw = meta.get("watermark") if isinstance(meta, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        src: ts
+        for src, ts in raw.items()
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool)
+    }
+
+
+def _in_window(ts: float | None, since_ts: float | None, until_ts: float | None) -> bool:
+    """True if *ts* lies in the ``[since_ts, until_ts)`` window (None = open end)."""
+    if ts is None:
+        return False
+    if since_ts is not None and ts < since_ts:
+        return False
+    return until_ts is None or ts < until_ts
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 def _track_batch(entries: dict[str, PricePair]) -> None:
-    """Persist multiple model usages to ``token_log.json`` in one write."""
+    """Persist multiple model usages to the token log in one write."""
+    _ensure_data_dir()
     lock = FileLock(_LOCK_PATH, timeout=10)
     with lock:
         log = _safe_read_json(TOKEN_LOG) or {}
         for model, (input_tokens, output_tokens) in entries.items():
-            if model not in log:
-                log[model] = {"input": 0, "output": 0}
-            log[model]["input"] += input_tokens
-            log[model]["output"] += output_tokens
-
-        # Write atomically
-        tmp = TOKEN_LOG.with_suffix(".tmp")
-        tmp.write_text(json.dumps(log, indent=2), encoding="utf-8")
-        tmp.replace(TOKEN_LOG)
+            entry = log.setdefault(model, {"input": 0, "output": 0})
+            if isinstance(entry, dict):
+                entry["input"] += input_tokens
+                entry["output"] += output_tokens
+        _write_log(log)
 
 
 def track_tokens(model: str, input_tokens: float, output_tokens: float) -> None:
@@ -375,10 +456,39 @@ def get_totals(pricing_file: str | None = None) -> dict[str, TotalsEntry]:
             data.get("input", 0), data.get("output", 0), _get_pricing(model, overrides)
         )
         for model, data in log.items()
+        if not model.startswith("_") and isinstance(data, dict)
     }
 
     _print_model_table(totals)
     return totals
+
+
+def export_csv(pricing_file: str | None = None) -> None:
+    """Print the tracked ledger as CSV on stdout, priced like ``get_totals``."""
+    log = _safe_read_json(TOKEN_LOG)
+    if not log:
+        print("No token log found.")
+        return
+
+    overrides = _load_pricing_overrides(pricing_file)
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["model", "input", "output", "input_cost", "output_cost", "total_cost"])
+    for model, data in log.items():
+        if model.startswith("_") or not isinstance(data, dict):
+            continue
+        t = _priced(
+            data.get("input", 0), data.get("output", 0), _get_pricing(model, overrides)
+        )
+        writer.writerow(
+            [
+                model,
+                int(t["input"]),
+                int(t["output"]),
+                f"{t['input_cost']:.6f}",
+                f"{t['output_cost']:.6f}",
+                f"{t['total_cost']:.6f}",
+            ]
+        )
 
 
 def _resolve_db_path(db_path: str | None) -> Path | None:
@@ -451,19 +561,23 @@ def scan_opencode_db(
     pricing_file: str | None = None,
     obfuscate: bool = False,
     monthly: bool = True,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan opencode SQLite database and track token usage.
 
     Reads actual ``tokens.input`` / ``tokens.output`` from the ``message`` table.
     Applies pricing from *pricing_file* (with whole-segment fallback matching),
-    then ``_DEFAULT_PRICING``.
+    then ``_DEFAULT_PRICING``. Only usage newer than the ledger's watermark for
+    this source is tracked; *since_ts*/*until_ts* bound a UTC epoch-seconds
+    window (start inclusive, end exclusive). Returns the newly tracked totals.
     """
     records = _collect_opencode(db_path, obfuscate)
     if records is None:
         return {}
 
     overrides = _load_pricing_overrides(pricing_file)
-    totals = _scan_report(records, overrides, monthly)
+    totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
     return {model: t for (_src, model), t in totals.items()}
 
 
@@ -532,20 +646,25 @@ def scan_pi(
     pricing_file: str | None = None,
     obfuscate: bool = False,
     monthly: bool = True,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan oh-my-pi session logs and track token usage.
 
     Reads exact ``usage.input`` / ``usage.output`` from assistant messages in
     the JSONL transcripts under *sessions_dir* (default ``~/.omp/agent/sessions``,
     one subdirectory per working directory, ``<ts>_<uuid>.jsonl`` files). Model
-    keys are ``provider/model``, matching the shared pricing-key scheme.
+    keys are ``provider/model``, matching the shared pricing-key scheme. Only
+    usage newer than the ledger's watermark for this source is tracked;
+    *since_ts*/*until_ts* bound a UTC epoch-seconds window (start inclusive,
+    end exclusive). Returns the newly tracked totals.
     """
     records = _collect_pi(sessions_dir, obfuscate)
     if records is None:
         return {}
 
     overrides = _load_pricing_overrides(pricing_file)
-    totals = _scan_report(records, overrides, monthly)
+    totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
     return {model: t for (_src, model), t in totals.items()}
 
 
@@ -555,11 +674,15 @@ def scan_all(
     pricing_file: str | None = None,
     obfuscate: bool = False,
     monthly: bool = True,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
 ) -> dict[tuple[str, str], TotalsEntry]:
     """Scan every known client source and report usage in one Source-tagged table.
 
     Combines the opencode DB and oh-my-pi session logs; missing sources are
-    reported and skipped. Returns totals keyed by ``(source, model)``; the
+    reported and skipped. Only usage newer than each source's ledger watermark
+    is tracked (*since_ts*/*until_ts* additionally bound a UTC epoch-seconds
+    window). Returns newly tracked totals keyed by ``(source, model)``; the
     ledger is persisted per model (sources merged).
     """
     records: list[UsageRecord] = []
@@ -579,7 +702,7 @@ def scan_all(
         return {}
 
     overrides = _load_pricing_overrides(pricing_file)
-    return _scan_report(records, overrides, monthly)
+    return _scan_report(records, overrides, monthly, since_ts, until_ts)
 
 
 def clear_log() -> None:
@@ -596,6 +719,15 @@ def clear_log() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _date_arg(value: str) -> float:
+    """argparse type: ``YYYY-MM-DD`` (UTC calendar date) to epoch seconds."""
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from exc
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -606,7 +738,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="totals",
-        choices=["totals", "scan-oc", "scan-pi", "scan-all", "clear", "pricing"],
+        choices=["totals", "scan-oc", "scan-pi", "scan-all", "clear", "pricing", "export"],
         help="Command to run (default: totals)",
     )
     parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
@@ -618,6 +750,22 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help="Directory of pi session logs for scan-pi/scan-all (default: ~/.omp/agent/sessions)",
+    )
+    parser.add_argument(
+        "--since",
+        dest="since",
+        metavar="DATE",
+        type=_date_arg,
+        default=None,
+        help="Track only usage on/after this UTC date (scanners)",
+    )
+    parser.add_argument(
+        "--until",
+        dest="until",
+        metavar="DATE",
+        type=_date_arg,
+        default=None,
+        help="Track only usage through this UTC date, inclusive (scanners)",
     )
     return parser
 
@@ -632,6 +780,9 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
         "monthly": not ns.no_monthly,
         "db_path": ns.db_path,
         "sessions_dir": ns.sessions_dir,
+        "since_ts": ns.since,
+        # --until names an inclusive calendar day; the window end is exclusive.
+        "until_ts": None if ns.until is None else ns.until + 86_400,
     }
 
 
@@ -649,6 +800,8 @@ def main(argv: list[str] | None = None) -> None:
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
             monthly=parsed.get("monthly", True),
+            since_ts=parsed.get("since_ts"),
+            until_ts=parsed.get("until_ts"),
         )
     elif cmd == "scan-pi":
         scan_pi(
@@ -656,6 +809,8 @@ def main(argv: list[str] | None = None) -> None:
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
             monthly=parsed.get("monthly", True),
+            since_ts=parsed.get("since_ts"),
+            until_ts=parsed.get("until_ts"),
         )
     elif cmd == "scan-all":
         scan_all(
@@ -664,17 +819,21 @@ def main(argv: list[str] | None = None) -> None:
             pricing_file=parsed.get("pricing_file"),
             obfuscate=parsed.get("obfuscate", False),
             monthly=parsed.get("monthly", True),
+            since_ts=parsed.get("since_ts"),
+            until_ts=parsed.get("until_ts"),
         )
     elif cmd == "clear":
         clear_log()
     elif cmd == "pricing":
-        _list_pricing_options()
+        _list_pricing_options(parsed.get("pricing_file"))
+    elif cmd == "export":
+        export_csv(pricing_file=parsed.get("pricing_file"))
     else:
         get_totals(pricing_file=parsed.get("pricing_file"))
 
 
-def _list_pricing_options() -> None:
-    """List all available pricing configurations."""
+def _list_pricing_options(pricing_file: str | None = None) -> None:
+    """List all available pricing configurations; with *pricing_file*, also its entries."""
     print("Pricing resolution order (highest to lowest):\n")
     print("  1. --pricing-file <path>: exact model-key match, then most-specific whole-segment match")
     print('  2. "_default" key inside the pricing file: fallback within the file')
@@ -682,6 +841,14 @@ def _list_pricing_options() -> None:
 
     print(f"Default (no match): ${_DEFAULT_PRICING[0]:.2f}/M input, ${_DEFAULT_PRICING[1]:.2f}/M output\n")
     print('Pricing file format: {"_default": [in_per_m, out_per_m], "provider/model": [in_per_m, out_per_m]}\n')
+
+    if pricing_file is not None:
+        overrides = _load_pricing_overrides(pricing_file)
+        print(f"Entries from {pricing_file}:\n")
+        for key in sorted(overrides):
+            pair = overrides[key]
+            label = "_default (file fallback)" if key == _DEFAULT_KEY else key
+            print(f"  {label}: ${pair[0]:.2f}/M input, ${pair[1]:.2f}/M output")
 
 
 if __name__ == "__main__":

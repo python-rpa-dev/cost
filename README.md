@@ -28,16 +28,20 @@ python token_tracker.py
 | `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
 | `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan all client sources; one table with a Source column |
 | `python token_tracker.py pricing` | Describe how pricing is configured and show the default fallback |
+| `python token_tracker.py export [--pricing-file <path>]` | Print the tracked ledger as CSV on stdout |
 | `python token_tracker.py clear` | Clear the token log file |
 
 ### Options
 
 - `--db-path <path>` — Scan an explicit opencode.db file (`scan-oc`/`scan-all`; default: auto-detect)
 - `--sessions-dir <path>` — Directory of pi session logs (`scan-pi`/`scan-all`; default: `~/.omp/agent/sessions`)
-- `--pricing-file <path>` — Use an external JSON file for pricing overrides (applies to `totals`, `scan-oc`, `scan-pi`, and `scan-all`)
-- `--no-monthly` — Suppress the monthly cost breakdown
+- `--pricing-file <path>` - Use an external JSON file for pricing overrides (applies to `totals`, `scan-oc`, `scan-pi`, `scan-all`, `export`, and `pricing`)
+- `--no-monthly` - Suppress the monthly cost breakdown
+- `--since YYYY-MM-DD` / `--until YYYY-MM-DD` - Track only usage within a UTC date window, both ends inclusive (`scan-oc`/`scan-pi`/`scan-all`)
 
-> A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan`.
+Scans are idempotent: each source tracks only usage newer than its watermark stored under `_meta` in `data/token_log.json`, so re-running a scan never double-counts. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history.
+
+> A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan-all`.
 
 ## Data Sources
 

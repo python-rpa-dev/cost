@@ -16,6 +16,7 @@ from token_tracker import (
     _parse_model_str,
     _safe_read_json,
     clear_log,
+    export_csv,
     get_totals,
     main,
     scan_all,
@@ -326,6 +327,11 @@ class TestMainDispatch:
             main(["token_tracker.py", "scan-pi"])
         m.assert_called_once()
 
+    def test_dispatch_export(self, capsys):
+        with patch("token_tracker.export_csv") as m:
+            main(["token_tracker.py", "export"])
+        m.assert_called_once()
+
 
 class TestListPricingOptions:
     def test_prints_default(self, capsys):
@@ -543,3 +549,124 @@ class TestScanAll:
         )
         assert result == {}
         assert "No data sources found." in capsys.readouterr().out
+
+
+class TestWatermark:
+    """Re-scanning a source must never double-count its history (regression)."""
+
+    def _scan(self, tmp_path, **kw):
+        log = tmp_path / "data" / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            return scan_opencode_db(monthly=False, **kw)
+
+    def _log(self, tmp_path):
+        return json.loads((tmp_path / "data" / "token_log.json").read_text())
+
+    def test_rescan_does_not_double_count(self, tmp_path, capsys):
+        db = _make_db(
+            tmp_path, [{"providerID": "p", "id": "m", "tokens": {"input": 1000, "output": 500}}]
+        )
+        first = self._scan(tmp_path, db_path=str(db))
+        assert first["p/m"]["input"] == 1000
+        second = self._scan(tmp_path, db_path=str(db))
+        assert second == {}
+        assert "already-tracked" in capsys.readouterr().out
+        assert self._log(tmp_path)["p/m"]["input"] == 1000
+
+    def test_watermark_advances_for_newer_rows(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 10, "output": 1}}
+        db = _make_db(tmp_path, [row, dict(row)], timestamps=[100, 200])
+        assert self._scan(tmp_path, db_path=str(db))["p/m"]["input"] == 20
+
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO message (data, time_created) VALUES (?, ?)", (json.dumps(row), 300)
+        )
+        conn.commit()
+        conn.close()
+
+        assert self._scan(tmp_path, db_path=str(db))["p/m"]["input"] == 10
+        log = self._log(tmp_path)
+        assert log["p/m"]["input"] == 30
+        assert log["_meta"]["watermark"]["opencode"] == 300
+
+    def test_window_filters_before_tracking(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}
+        db = _make_db(tmp_path, [row, dict(row)], timestamps=[100, 1000])
+        got = self._scan(tmp_path, db_path=str(db), since_ts=500)
+        assert got["p/m"]["input"] == 100
+
+    def test_get_totals_ignores_meta(self, tmp_path, capsys):
+        log = tmp_path / "data" / "token_log.json"
+        log.parent.mkdir()
+        log.write_text(
+            json.dumps({"p/m": {"input": 100, "output": 10}, "_meta": {"watermark": {"opencode": 5}}})
+        )
+        with patch("token_tracker.TOKEN_LOG", log):
+            totals = get_totals()
+        assert list(totals) == ["p/m"]
+        assert "_meta" not in capsys.readouterr().out
+
+    def test_track_tokens_coexists_with_meta(self, tmp_path):
+        log = tmp_path / "data" / "token_log.json"
+        db = _make_db(
+            tmp_path, [{"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}]
+        )
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            scan_opencode_db(db_path=str(db), monthly=False)
+            track_tokens("manual/x", 7, 3)
+        data = json.loads(log.read_text())
+        assert data["manual/x"] == {"input": 7, "output": 3}
+        assert "_meta" in data
+
+
+class TestExportCsv:
+    def test_exports_priced_rows(self, tmp_path, capsys):
+        log = tmp_path / "token_log.json"
+        log.write_text(
+            json.dumps({"p/m": {"input": 1_000_000, "output": 500_000}, "_meta": {"watermark": {}}})
+        )
+        with patch("token_tracker.TOKEN_LOG", log):
+            export_csv()
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "model,input,output,input_cost,output_cost,total_cost"
+        model, in_tok, out_tok, in_cost, out_cost, total = lines[1].split(",")
+        assert (model, in_tok, out_tok) == ("p/m", "1000000", "500000")
+        # Default pricing 0.03/M in + 0.05/M out -> $0.03 + $0.025 = $0.055
+        assert (in_cost, out_cost, total) == ("0.030000", "0.025000", "0.055000")
+
+    def test_no_log(self, tmp_path, capsys):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "none.json"):
+            export_csv()
+        assert capsys.readouterr().out == "No token log found.\n"
+
+
+class TestPricingFileListing:
+    def test_lists_file_entries(self, tmp_path, capsys):
+        f = tmp_path / "pricing.json"
+        f.write_text('{"_default": [1.0, 2.0], "prov/model": [3.0, 4.0]}')
+        _list_pricing_options(str(f))
+        out = capsys.readouterr().out
+        assert "prov/model: $3.00/M input, $4.00/M output" in out
+        assert "_default (file fallback): $1.00/M input, $2.00/M output" in out
+
+    def test_without_file_lists_no_entries(self, capsys):
+        _list_pricing_options()
+        assert "Entries from" not in capsys.readouterr().out
+
+
+class TestWindowCli:
+    def test_since_until_parsed_as_utc_days(self):
+        args = _parse_cli_args(
+            ["token_tracker.py", "scan-oc", "--since", "2023-01-01", "--until", "2023-01-05"]
+        )
+        assert args["since_ts"] == 1_672_531_200  # 2023-01-01T00:00Z, inclusive start
+        assert args["until_ts"] == 1_672_876_800 + 86_400  # through 2023-01-05 inclusive
+
+    def test_bad_date_rejected(self):
+        with pytest.raises(SystemExit):
+            _parse_cli_args(["token_tracker.py", "scan-oc", "--since", "not-a-date"])

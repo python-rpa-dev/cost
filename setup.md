@@ -7,21 +7,24 @@ A module that tracks LLM token usage per model, persisted to a local JSON file. 
 ## API
 
 ### `track_tokens(model: str, input_tokens: float, output_tokens: float)`
-Persist raw token counts per model to `token_log.json`. Pricing is applied at display time (see pricing resolution), never stored.
+Persist raw token counts per model to `data/token_log.json`. Pricing is applied at display time (see pricing resolution), never stored. Manual entries coexist with scanner watermarks under the `_meta` key, which readers must ignore.
 
 ### `get_totals()`
 Print per-model and aggregate input/output token totals, plus cost as an aligned table (`Model / Input / Output / Cost`) with a separator rule before the `Total` row.
 
-### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
-Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing via whole-segment matching against `--pricing-file` entries, falling back to the file's `_default` key and then `_DEFAULT_PRICING`. When `obfuscate=True`, the DB path in output is truncated to the last 25 characters.
+### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True, since_ts: float | None = None, until_ts: float | None = None)`
+Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing via whole-segment matching against `--pricing-file` entries, falling back to the file's `_default` key and then `_DEFAULT_PRICING`. When `obfuscate=True`, the DB path in output is truncated to the last 25 characters. Only records newer than the ledger watermark for source `opencode` are tracked; `since_ts`/`until_ts` bound a UTC epoch-seconds window (start inclusive, end exclusive). Returns newly tracked totals keyed by model.
 
-Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the usage table with a leading `Source` column (`Source / Model / Input / Output / Cost`; grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line.
+Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the usage table with a leading `Source` column (`Source / Model / Input / Output / Cost`; grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line. Already-tracked records are reported per source (`Skipped N already-tracked record(s) from <source>.`); when nothing is new, the scan prints `No new usage to track.` and renders no table.
 
-### `scan_pi(sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
-Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently.
+### `scan_pi(sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True, since_ts: float | None = None, until_ts: float | None = None)`
+Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently. Watermark and window semantics identical to `scan_opencode_db` (source `oh-my-pi`).
 
-### `scan_all(db_path: str | None = None, sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
-Scan every known client source (opencode DB + oh-my-pi session logs) and render one combined table with a Source column. Missing sources are reported and skipped. Returns totals keyed by `(source, model)`; the ledger persists per model (sources merged).
+### `scan_all(db_path: str | None = None, sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True, since_ts: float | None = None, until_ts: float | None = None)`
+Scan every known client source (opencode DB + oh-my-pi session logs) and render one combined table with a Source column. Missing sources are reported and skipped. Watermarks advance independently per source. Returns newly tracked totals keyed by `(source, model)`; the ledger persists per model (sources merged).
+
+### `export_csv(pricing_file: str | None = None)`
+Print the tracked ledger as CSV on stdout (`model,input,output,input_cost,output_cost,total_cost`), priced like `get_totals`. The `_meta` section is excluded. Redirect to a file for spreadsheet use.
 
 ### `clear_log()`
 Remove the token log file.
@@ -38,7 +41,8 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 - `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate]` — scan opencode SQLite database (primary)
 - `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate]` — scan oh-my-pi session logs
 - `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path> ...]` — scan all client sources; combined Source-tagged table
-- `python token_tracker.py pricing` — list all available pricing options
+- `python token_tracker.py pricing [--pricing-file <path>]` — describe pricing resolution; with a file, also list its entries
+- `python token_tracker.py export [--pricing-file <path>]` — print the ledger as CSV on stdout
 - `python token_tracker.py clear` — clear the log
 
 ## Data Sources
@@ -84,8 +88,9 @@ any `.../qwen/...` model).
 ## Requirements (non-functional)
 
 - **Safe JSON reads** — all JSON file reads must handle missing/corrupted files gracefully, returning `{}` or skipping
-- **Concurrent safety** — `track_tokens` must use file locking to prevent race conditions on `token_log.json`
+- **Concurrent safety** — all ledger writers must use file locking to prevent race conditions on `data/token_log.json`
 - **Atomic writes** — token log writes must be atomic (temp file + rename) to prevent corruption
+- **Idempotent scans** — scanners must skip records at or below the per-source timestamp watermark stored under `_meta` in the ledger; re-running a scan must never double-count
 - **Cross-platform DB discovery** — `scan_opencode_db` must auto-detect the opencode SQLite database on Windows (`AppData/Roaming`, `.local/share`) and Linux/macOS (`.local/share`)
 - **Use real token data** — `scan_opencode_db` must read actual `tokens.input` / `tokens.output` from message JSON, not estimate from text
 - **Pricing support** — usage is persisted as raw counts; `get_totals`, `scan_opencode_db`, and `scan_pi` must compute cost via the shared pricing resolution (`_get_pricing`) and display per-model and total cost

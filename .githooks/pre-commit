@@ -1,0 +1,14 @@
+#!/bin/sh
+# Fast pre-commit gate: ruff + vulture + pyright (full suite: `make check`).
+# Enable once per clone:  git config core.hooksPath .githooks
+if [ -x .venv-linux/bin/ruff ]; then
+    BIN=.venv-linux/bin; EXE=
+elif [ -x .venv-windows/Scripts/ruff.exe ]; then
+    BIN=.venv-windows/Scripts; EXE=.exe
+else
+    echo "pre-commit: no venv found (run the token_tracker launcher first); skipping checks" >&2
+    exit 0
+fi
+"$BIN/ruff$EXE" check . || exit 1
+"$BIN/vulture$EXE" || exit 1
+"$BIN/pyright$EXE" token_tracker.py tests || exit 1

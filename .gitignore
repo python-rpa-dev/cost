@@ -24,9 +24,8 @@ coverage.xml
 # Ruff
 .ruff_cache/
 
-# Runtime token log (user-specific, regenerable)
-token_log.json
-token_log.json.lock
+# Runtime data (user-specific, regenerable): token_log.json, lock/tmp files, .coverage
+data/
 
 # IDE
 .vscode/
