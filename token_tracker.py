@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import csv
 import json
+import os
 import sqlite3
 import sys
 from collections.abc import Iterable
@@ -416,6 +417,20 @@ def _in_window(ts: float | None, since_ts: float | None, until_ts: float | None)
     return until_ts is None or ts < until_ts
 
 
+def _detect_env() -> str:
+    """Best-effort environment label: ``wsl``, ``windows``, or ``local``."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return "wsl"
+    if sys.platform == "win32":
+        return "windows"
+    return "local"
+
+
+def _tag_env(records: list[UsageRecord], env: str) -> list[UsageRecord]:
+    """Suffix each record's source with the environment, e.g. ``opencode@wsl``."""
+    return [rec._replace(source=f"{rec.source}@{env}") for rec in records]
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -563,19 +578,24 @@ def scan_opencode_db(
     monthly: bool = True,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    env: str | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan opencode SQLite database and track token usage.
 
     Reads actual ``tokens.input`` / ``tokens.output`` from the ``message`` table.
     Applies pricing from *pricing_file* (with whole-segment fallback matching),
-    then ``_DEFAULT_PRICING``. Only usage newer than the ledger's watermark for
-    this source is tracked; *since_ts*/*until_ts* bound a UTC epoch-seconds
-    window (start inclusive, end exclusive). Returns the newly tracked totals.
+    then ``_DEFAULT_PRICING``. Records are tagged ``opencode@<env>`` (*env*
+    defaults to auto-detection: ``wsl``/``windows``/``local``) so each OS's own
+    database keeps an independent watermark in a shared ledger. Only usage
+    newer than that watermark is tracked; *since_ts*/*until_ts* bound a UTC
+    epoch-seconds window (start inclusive, end exclusive). Returns the newly
+    tracked totals.
     """
     records = _collect_opencode(db_path, obfuscate)
     if records is None:
         return {}
 
+    records = _tag_env(records, env or _detect_env())
     overrides = _load_pricing_overrides(pricing_file)
     totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
     return {model: t for (_src, model), t in totals.items()}
@@ -648,21 +668,24 @@ def scan_pi(
     monthly: bool = True,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    env: str | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan oh-my-pi session logs and track token usage.
 
     Reads exact ``usage.input`` / ``usage.output`` from assistant messages in
     the JSONL transcripts under *sessions_dir* (default ``~/.omp/agent/sessions``,
     one subdirectory per working directory, ``<ts>_<uuid>.jsonl`` files). Model
-    keys are ``provider/model``, matching the shared pricing-key scheme. Only
-    usage newer than the ledger's watermark for this source is tracked;
-    *since_ts*/*until_ts* bound a UTC epoch-seconds window (start inclusive,
-    end exclusive). Returns the newly tracked totals.
+    keys are ``provider/model``, matching the shared pricing-key scheme. Records
+    are tagged ``oh-my-pi@<env>`` (see :func:`scan_opencode_db`); each OS's own
+    session directory keeps an independent watermark. Only usage newer than
+    that watermark is tracked; *since_ts*/*until_ts* bound a UTC epoch-seconds
+    window (start inclusive, end exclusive). Returns the newly tracked totals.
     """
     records = _collect_pi(sessions_dir, obfuscate)
     if records is None:
         return {}
 
+    records = _tag_env(records, env or _detect_env())
     overrides = _load_pricing_overrides(pricing_file)
     totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
     return {model: t for (_src, model), t in totals.items()}
@@ -676,25 +699,30 @@ def scan_all(
     monthly: bool = True,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    env: str | None = None,
 ) -> dict[tuple[str, str], TotalsEntry]:
     """Scan every known client source and report usage in one Source-tagged table.
 
     Combines the opencode DB and oh-my-pi session logs; missing sources are
-    reported and skipped. Only usage newer than each source's ledger watermark
-    is tracked (*since_ts*/*until_ts* additionally bound a UTC epoch-seconds
-    window). Returns newly tracked totals keyed by ``(source, model)``; the
-    ledger is persisted per model (sources merged).
+    reported and skipped. Records carry ``source@<env>`` labels (see
+    :func:`scan_opencode_db`), so scans from several environments aggregate
+    into one ledger with independent watermarks per source *and* environment.
+    Only usage newer than each watermark is tracked (*since_ts*/*until_ts*
+    additionally bound a UTC epoch-seconds window). Returns newly tracked
+    totals keyed by ``(source@env, model)``; the ledger persists per model
+    (sources merged).
     """
     records: list[UsageRecord] = []
     found = False
+    env_label = env or _detect_env()
 
     oc_records = _collect_opencode(db_path, obfuscate)
     if oc_records is not None:
-        records.extend(oc_records)
+        records.extend(_tag_env(oc_records, env_label))
         found = True
     pi_records = _collect_pi(sessions_dir, obfuscate)
     if pi_records is not None:
-        records.extend(pi_records)
+        records.extend(_tag_env(pi_records, env_label))
         found = True
 
     if not found:
@@ -767,6 +795,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Track only usage through this UTC date, inclusive (scanners)",
     )
+    parser.add_argument(
+        "--env",
+        metavar="NAME",
+        default=None,
+        help="Environment label appended to scan sources and watermarks (default: auto-detect wsl/windows/local)",
+    )
     return parser
 
 
@@ -780,6 +814,7 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
         "monthly": not ns.no_monthly,
         "db_path": ns.db_path,
         "sessions_dir": ns.sessions_dir,
+        "env": ns.env,
         "since_ts": ns.since,
         # --until names an inclusive calendar day; the window end is exclusive.
         "until_ts": None if ns.until is None else ns.until + 86_400,
@@ -802,6 +837,7 @@ def main(argv: list[str] | None = None) -> None:
             monthly=parsed.get("monthly", True),
             since_ts=parsed.get("since_ts"),
             until_ts=parsed.get("until_ts"),
+            env=parsed.get("env"),
         )
     elif cmd == "scan-pi":
         scan_pi(
@@ -811,6 +847,7 @@ def main(argv: list[str] | None = None) -> None:
             monthly=parsed.get("monthly", True),
             since_ts=parsed.get("since_ts"),
             until_ts=parsed.get("until_ts"),
+            env=parsed.get("env"),
         )
     elif cmd == "scan-all":
         scan_all(
@@ -821,6 +858,7 @@ def main(argv: list[str] | None = None) -> None:
             monthly=parsed.get("monthly", True),
             since_ts=parsed.get("since_ts"),
             until_ts=parsed.get("until_ts"),
+            env=parsed.get("env"),
         )
     elif cmd == "clear":
         clear_log()

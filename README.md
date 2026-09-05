@@ -38,8 +38,9 @@ python token_tracker.py
 - `--pricing-file <path>` - Use an external JSON file for pricing overrides (applies to `totals`, `scan-oc`, `scan-pi`, `scan-all`, `export`, and `pricing`)
 - `--no-monthly` - Suppress the monthly cost breakdown
 - `--since YYYY-MM-DD` / `--until YYYY-MM-DD` - Track only usage within a UTC date window, both ends inclusive (`scan-oc`/`scan-pi`/`scan-all`)
+- `--env NAME` - Environment label appended to scan sources and watermarks (default: auto-detect `wsl`/`windows`/`local`)
 
-Scans are idempotent: each source tracks only usage newer than its watermark stored under `_meta` in `data/token_log.json`, so re-running a scan never double-counts. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history.
+Scans are idempotent per source *and* environment: each records only usage newer than its watermark (`opencode@wsl`, `oh-my-pi@windows`, …) stored under `_meta` in `data/token_log.json`. Running scans from WSL and Windows against the same repo folder aggregates both environments into one ledger without double-counting; the Source column shows which environment produced each row. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history.
 
 > A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan-all`.
 

@@ -8,6 +8,7 @@ import pytest
 
 from token_tracker import (
     _DEFAULT_PRICING,
+    _detect_env,
     _fmt,
     _get_pricing,
     _list_pricing_options,
@@ -507,6 +508,7 @@ class TestScanPi:
 
 class TestScanAll:
     def _scan_all(self, tmp_path, **kw):
+        kw.setdefault("env", "t")
         with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
             "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
         ):
@@ -521,8 +523,8 @@ class TestScanAll:
         result = self._scan_all(
             tmp_path, db_path=str(db), sessions_dir=str(root), monthly=False
         )
-        assert ("opencode", "p/m") in result
-        assert ("oh-my-pi", "prov/mdl") in result
+        assert ("opencode@t", "p/m") in result
+        assert ("oh-my-pi@t", "prov/mdl") in result
         assert "Source" in capsys.readouterr().out
         # Ledger persists per model; sources merge under the plain model key.
         data = json.loads((tmp_path / "token_log.json").read_text())
@@ -537,7 +539,7 @@ class TestScanAll:
             sessions_dir=str(root),
             monthly=False,
         )
-        assert list(result) == [("oh-my-pi", "prov/mdl")]
+        assert list(result) == [("oh-my-pi@t", "prov/mdl")]
         assert "No opencode database found." in capsys.readouterr().out
 
     def test_no_sources(self, tmp_path, capsys):
@@ -555,6 +557,7 @@ class TestWatermark:
     """Re-scanning a source must never double-count its history (regression)."""
 
     def _scan(self, tmp_path, **kw):
+        kw.setdefault("env", "t")
         log = tmp_path / "data" / "token_log.json"
         with patch("token_tracker.TOKEN_LOG", log), patch(
             "token_tracker._LOCK_PATH", str(log) + ".lock"
@@ -590,7 +593,7 @@ class TestWatermark:
         assert self._scan(tmp_path, db_path=str(db))["p/m"]["input"] == 10
         log = self._log(tmp_path)
         assert log["p/m"]["input"] == 30
-        assert log["_meta"]["watermark"]["opencode"] == 300
+        assert log["_meta"]["watermark"]["opencode@t"] == 300
 
     def test_window_filters_before_tracking(self, tmp_path):
         row = {"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}
@@ -670,3 +673,51 @@ class TestWindowCli:
     def test_bad_date_rejected(self):
         with pytest.raises(SystemExit):
             _parse_cli_args(["token_tracker.py", "scan-oc", "--since", "not-a-date"])
+
+
+class TestEnvTagging:
+    """Watermarks must be independent per environment (WSL + Windows share one ledger)."""
+
+    def test_detect_env_wsl(self, monkeypatch):
+        monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-24.04")
+        assert _detect_env() == "wsl"
+
+    def test_detect_env_windows(self, monkeypatch):
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+        monkeypatch.delenv("WSL_INTEROP", raising=False)
+        monkeypatch.setattr("token_tracker.sys.platform", "win32")
+        assert _detect_env() == "windows"
+
+    def test_detect_env_local(self, monkeypatch):
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+        monkeypatch.delenv("WSL_INTEROP", raising=False)
+        monkeypatch.setattr("token_tracker.sys.platform", "linux")
+        assert _detect_env() == "local"
+
+    def test_two_environments_aggregate(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}
+        (tmp_path / "wsl").mkdir()
+        (tmp_path / "win").mkdir()
+        db_wsl = _make_db(tmp_path / "wsl", [row])
+        db_win = _make_db(tmp_path / "win", [dict(row)])
+        log = tmp_path / "data" / "token_log.json"
+
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            first = scan_opencode_db(db_path=str(db_wsl), monthly=False, env="wsl")
+            second = scan_opencode_db(db_path=str(db_win), monthly=False, env="windows")
+            third = scan_opencode_db(db_path=str(db_wsl), monthly=False, env="wsl")
+
+        assert first["p/m"]["input"] == 100
+        # The windows scan must not be skipped by the wsl watermark.
+        assert second["p/m"]["input"] == 100
+        # Per-environment idempotence still holds.
+        assert third == {}
+        data = json.loads(log.read_text())
+        assert data["p/m"]["input"] == 200  # both environments aggregated
+        assert set(data["_meta"]["watermark"]) == {"opencode@wsl", "opencode@windows"}
+
+    def test_env_cli_flag(self):
+        args = _parse_cli_args(["token_tracker.py", "scan-all", "--env", "desktop"])
+        assert args["env"] == "desktop"
