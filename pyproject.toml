@@ -16,6 +16,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.4",
+    "pyright>=1.1",
 ]
 
 [project.scripts]
@@ -33,10 +34,11 @@ ignore = ["E501"]
 known-first-party = ["token_tracker"]
 
 [tool.vulture]
-paths = ["token_tracker.py"]
+# tests are scanned so public API used by them (e.g. track_tokens) counts as live;
+# the three names below are TotalsEntry TypedDict members, read via subscript — vulture blind spot
+paths = ["token_tracker.py", "tests"]
 min_confidence = 60
-verbose = true
-ignore_names = ["input_price_per_m", "output_price_per_m"]
+ignore_names = ["input", "output", "total_cost"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

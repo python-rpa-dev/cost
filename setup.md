@@ -2,36 +2,23 @@
 
 ## Overview
 
-A module that tracks LLM token usage per model, persisted to a local JSON file. Supports reading from the opencode SQLite database (`opencode.db`) and legacy JSON session files.
+A module that tracks LLM token usage per model, persisted to a local JSON file. Reads real reported usage from the opencode SQLite database (`opencode.db`) and oh-my-pi session logs.
 
 ## API
 
-### `track_tokens(model: str, input_tokens: float, output_tokens: float, input_price_per_m: float = 0.0, output_price_per_m: float = 0.0)`
-Persist token usage per model to `token_log.json`, including pricing info.
+### `track_tokens(model: str, input_tokens: float, output_tokens: float)`
+Persist raw token counts per model to `token_log.json`. Pricing is applied at display time (see pricing resolution), never stored.
 
 ### `get_totals()`
-Print per-model and aggregate input/output token totals, plus cost. Output format:
-```
-<model>: input=<N>, output=<N>, total=<N>, input_price=$X.XX/M, output_price=$X.XX/M, cost=$X.XX
-Total: input=<N>, output=<N>, cost=$X.XX
-```
+Print per-model and aggregate input/output token totals, plus cost as an aligned table (`Model / Input / Output / Cost`) with a separator rule before the `Total` row.
 
-### `estimate_tokens(text: str) -> int`
-Rough word-to-token estimate (`words * 1.3`).
-
-### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False)`
+### `scan_opencode_db(db_path: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
 Read actual token counts from the opencode SQLite database. Auto-detects the DB path across platforms. Applies pricing via whole-segment matching against `--pricing-file` entries, falling back to the file's `_default` key and then `_DEFAULT_PRICING`. When `obfuscate=True`, the DB path in output is truncated to the last 25 characters.
 
-Scan output format:
-```
-Scanning <N> messages from <path>...
-  <model>: input=<N>, output=<N>, input_price=$X.XX/M, output_price=$X.XX/M, cost=$X.XX
-Total scanned: input=<N>, output=<N>, cost=$X.XX
-Date range: <start_date> to <end_date>, <N> days span
-```
+Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the model table (grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line.
 
-### `scan_sessions(session_dir: str = ".opencode/sessions", model: str = "local-llm")`
-Walk legacy JSON session files, estimate tokens from user/assistant message content, track via `track_tokens`.
+### `scan_pi(sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True)`
+Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently.
 
 ### `clear_log()`
 Remove the token log file.
@@ -46,14 +33,14 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 
 - `python token_tracker.py` — print totals
 - `python token_tracker.py scan [--pricing-file <path>] [--obfuscate]` — scan opencode SQLite database (primary)
-- `python token_tracker.py scan-json` — scan legacy JSON session files
+- `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate]` — scan oh-my-pi session logs
 - `python token_tracker.py pricing` — list all available pricing options
 - `python token_tracker.py clear` — clear the log
 
 ## Data Sources
 
 - **opencode SQLite database** — `C:\Users\<user>\.local\share\opencode\opencode.db` (Windows/Linux), `~/.local/share/opencode/opencode.db` (macOS/Linux). Reads actual `tokens.input` / `tokens.output` from the `message` table.
-- **Legacy JSON sessions** — `.opencode/sessions/*.json` (fallback for older opencode versions).
+- **oh-my-pi session logs** — `~/.omp/agent/sessions/**/*.jsonl`. Reads exact `usage.input` / `usage.output` from assistant messages.
 
 ## Pricing System
 
@@ -97,19 +84,19 @@ any `.../qwen/...` model).
 - **Atomic writes** — token log writes must be atomic (temp file + rename) to prevent corruption
 - **Cross-platform DB discovery** — `scan_opencode_db` must auto-detect the opencode SQLite database on Windows (`AppData/Roaming`, `.local/share`) and Linux/macOS (`.local/share`)
 - **Use real token data** — `scan_opencode_db` must read actual `tokens.input` / `tokens.output` from message JSON, not estimate from text
-- **Pricing support** — `track_tokens` must accept `input_price_per_m` and `output_price_per_m` parameters; `get_totals` must compute and display cost per model and total
+- **Pricing support** — usage is persisted as raw counts; `get_totals`, `scan_opencode_db`, and `scan_pi` must compute cost via the shared pricing resolution (`_get_pricing`) and display per-model and total cost
 - **Configurable pricing** — must support a `--pricing-file` CLI flag for external JSON pricing files (with `_default` fallback support) and whole-segment matching against configured model keys
 - **Default fallback pricing** — `_DEFAULT_PRICING` (`(0.03, 0.05)`) must be used as fallback when no model match is found; `--pricing-file` JSON files may override it via the `_default` key
 - **Pricing listing** — `pricing` CLI command must describe how pricing is configured (defaults vs `--pricing-file`) and show the current `_DEFAULT_PRICING` fallback
 - **Per-model totals** — `get_totals` must display per-model input + output sum + cost
 - **Scan output cost** — `scan_opencode_db` must display per-model `cost=$X.XX` and total `cost=$X.XX` in scan output
-- **Scan path display** — scan output must show the DB path being scanned
+- **Scan path display** — scan output must show the source path being scanned
 - **Message count** — scan output must show the number of messages scanned
 - **Date range** — scan output must show minimum start date, maximum end date, and total days span
 - **Obfuscate path** — `scan_opencode_db` must support `--obfuscate` flag to truncate the DB path in output to the last 25 characters
 - **Number formatting** — token amounts must use apostrophe delimiter (e.g. `302'210'678`)
-- **Graceful session parsing** — `scan_sessions` must skip unparseable session files with a warning instead of crashing
-- **Configurable model name** — `scan_sessions` must accept a `model` parameter instead of hardcoding
+- **Graceful session parsing** — `scan_pi` must skip unreadable session files with a warning and malformed JSONL lines silently instead of crashing
+- **Exact usage only** — scanners must persist real reported token counts, never text-based estimates
 - **Model name normalization** — model identifiers stored as JSON strings (e.g. `{"id":"x","providerID":"y"}`) must be parsed into a readable `provider/model` format
 - **Correct formatting** — no unnecessary format specifiers on `int` values
 - **Type hints** — all public functions must have type hints

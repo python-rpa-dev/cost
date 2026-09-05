@@ -1,14 +1,16 @@
-"""Token usage tracker for LLM interactions."""
+"""Token usage tracker for LLM client harnesses (opencode, oh-my-pi)."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
 import json
+import sqlite3
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, TypedDict
 
 from filelock import FileLock
 
@@ -17,6 +19,34 @@ _LOCK_PATH = str(TOKEN_LOG) + ".lock"
 
 
 _DEFAULT_PRICING: tuple[float, float] = (0.03, 0.05)
+
+#: ``(input_price_per_million, output_price_per_million)``.
+PricePair = tuple[float, float]
+
+#: Sentinel key under which a pricing file's own fallback is stored.
+_DEFAULT_KEY = "__default"
+
+
+class TotalsEntry(TypedDict):
+    """Aggregated usage and cost for one model."""
+
+    input: float
+    output: float
+    input_cost: float
+    output_cost: float
+    total_cost: float
+
+
+class UsageRecord(NamedTuple):
+    """One usage observation from any client harness.
+
+    ``ts`` is epoch seconds (already normalized from ms) or ``None``.
+    """
+
+    key: str
+    input_tokens: float
+    output_tokens: float
+    ts: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +97,21 @@ def _safe_read_json(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, tuple[float, float]]:
+def _coerce_pair(value: Any) -> PricePair | None:
+    """Coerce a JSON ``[in_per_m, out_per_m]`` value; None if malformed."""
+    with contextlib.suppress(TypeError, ValueError, IndexError):
+        vals = [float(v) for v in value]
+        return (vals[0], vals[1])
+    return None
+
+
+def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, PricePair]:
     """Load pricing overrides from a JSON file.
 
     Returns a merged dict of {model_key: (input_per_m, output_per_m)}.
     Supports ``_default`` key for fallback pricing.
     """
-    result: dict[str, tuple[float, float]] = {}
+    result: dict[str, PricePair] = {}
 
     if pricing_file:
         path = Path(pricing_file)
@@ -81,21 +119,21 @@ def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, tuple[
         if data is not None:
             default = _DEFAULT_PRICING
             if "_default" in data:
-                with contextlib.suppress(TypeError, ValueError):
-                    vals = [float(v) for v in data["_default"]]
-                    default = (vals[0], vals[1])
-            result["__default"] = default
+                pair = _coerce_pair(data["_default"])
+                if pair is not None:
+                    default = pair
+            result[_DEFAULT_KEY] = default
             for key, value in data.items():
                 if key == "_default":
                     continue
-                with contextlib.suppress(TypeError, ValueError):
-                    vals = [float(v) for v in value]
-                    result[key] = (vals[0], vals[1])
+                pair = _coerce_pair(value)
+                if pair is not None:
+                    result[key] = pair
 
     return result
 
 
-def _get_pricing(model_key: str, overrides: dict[str, tuple[float, float]]) -> tuple[float, float]:
+def _get_pricing(model_key: str, overrides: dict[str, PricePair]) -> PricePair:
     """Look up pricing for a model key.
 
     Resolution order: exact match, then the most specific override whose path
@@ -110,7 +148,7 @@ def _get_pricing(model_key: str, overrides: dict[str, tuple[float, float]]) -> t
     best_key: str | None = None
     best_len = -1
     for key in overrides:
-        if key.startswith("__default"):
+        if key.startswith(_DEFAULT_KEY):
             continue
         key_parts = key.split("/")
         is_prefix = len(key_parts) <= len(model_parts) and all(
@@ -122,7 +160,7 @@ def _get_pricing(model_key: str, overrides: dict[str, tuple[float, float]]) -> t
 
     if best_key is not None:
         return overrides[best_key]
-    return overrides.get("__default", _DEFAULT_PRICING)
+    return overrides.get(_DEFAULT_KEY, _DEFAULT_PRICING)
 
 
 def _parse_model_str(data: dict[str, Any]) -> str:
@@ -135,9 +173,118 @@ def _parse_model_str(data: dict[str, Any]) -> str:
     return f"{provider}/{model_id}"
 
 
-def estimate_tokens(text: str) -> int:
-    """Rough word-to-token estimate (1 token ~= 1.3 words)."""
-    return int(len(text.split()) * 1.3) if text else 0
+def _to_epoch_seconds(value: Any) -> float | None:
+    """Normalize an epoch timestamp (seconds or milliseconds) to seconds."""
+    if not value:
+        return None
+    with contextlib.suppress(TypeError, ValueError):
+        ts = float(value)
+        # Values above ~1e11 are milliseconds since epoch (seconds stay below until year 5138).
+        return ts / 1000 if ts > 1e11 else ts
+    return None
+
+
+def _cost(tokens: float, per_m: float) -> float:
+    """Cost in USD for *tokens* at *per_m* dollars per million tokens."""
+    return tokens * per_m / 1_000_000
+
+
+def _priced(input_tokens: float, output_tokens: float, price: PricePair) -> TotalsEntry:
+    """Build a totals entry from raw token counts and a pricing pair."""
+    input_cost = _cost(input_tokens, price[0])
+    output_cost = _cost(output_tokens, price[1])
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": input_cost + output_cost,
+    }
+
+
+def _aggregate(
+    records: Iterable[UsageRecord], overrides: dict[str, PricePair]
+) -> tuple[dict[str, TotalsEntry], dict[str, dict[str, float]], float | None, float | None]:
+    """Sum usage records into per-model totals plus monthly buckets.
+
+    Shared core for every client scanner. Records with zero input *and* output
+    are skipped. Returns ``(totals, by_month, min_ts, max_ts)`` where
+    ``by_month`` maps ``"YYYY-MM"`` (UTC) to summed usage and cost.
+    """
+    sums: dict[str, list[float]] = {}
+    price_cache: dict[str, PricePair] = {}
+    by_month: dict[str, dict[str, float]] = {}
+    min_ts: float | None = None
+    max_ts: float | None = None
+
+    for rec in records:
+        if rec.input_tokens == 0 and rec.output_tokens == 0:
+            continue
+
+        if rec.key not in sums:
+            sums[rec.key] = [0.0, 0.0]
+            price_cache[rec.key] = _get_pricing(rec.key, overrides)
+        acc = sums[rec.key]
+        acc[0] += rec.input_tokens
+        acc[1] += rec.output_tokens
+
+        if rec.ts is not None:
+            if min_ts is None or rec.ts < min_ts:
+                min_ts = rec.ts
+            if max_ts is None or rec.ts > max_ts:
+                max_ts = rec.ts
+
+            month_key = datetime.fromtimestamp(rec.ts, tz=timezone.utc).strftime("%Y-%m")
+            if month_key not in by_month:
+                by_month[month_key] = {"input": 0.0, "output": 0.0, "cost": 0.0}
+            price = price_cache[rec.key]
+            by_month[month_key]["input"] += rec.input_tokens
+            by_month[month_key]["output"] += rec.output_tokens
+            by_month[month_key]["cost"] += _cost(rec.input_tokens, price[0]) + _cost(
+                rec.output_tokens, price[1]
+            )
+
+    totals = {key: _priced(acc[0], acc[1], price_cache[key]) for key, acc in sums.items()}
+    return totals, by_month, min_ts, max_ts
+
+
+def _print_model_table(totals: dict[str, TotalsEntry], total_label: str = "Total") -> None:
+    """Print the per-model usage table with a grand-total row."""
+    rows: list[tuple[str, ...]] = [
+        (key, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}")
+        for key, t in totals.items()
+    ]
+    grand_input = sum(t["input"] for t in totals.values())
+    grand_output = sum(t["output"] for t in totals.values())
+    grand_cost = sum(t["total_cost"] for t in totals.values())
+    rows.append((total_label, _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
+    print()
+    _print_table(("Model", "Input", "Output", "Cost"), rows, "<>>>", rule_before=len(rows) - 1)
+
+
+def _print_monthly(by_month: dict[str, dict[str, float]]) -> None:
+    """Print the monthly usage breakdown, if any buckets exist."""
+    month_rows = [
+        (month_key, _fmt(m["input"]), _fmt(m["output"]), f"${m['cost']:.2f}")
+        for month_key, m in sorted(by_month.items())
+    ]
+    if not month_rows:
+        return
+    print("\nMonthly Breakdown:")
+    _print_table(("Month", "Input", "Output", "Cost"), month_rows)
+
+
+def _print_date_range(min_ts: float | None, max_ts: float | None) -> None:
+    """Print the covered date range, if any timestamp was seen."""
+    if min_ts is None or max_ts is None:
+        return
+    min_dt = datetime.fromtimestamp(min_ts, tz=timezone.utc)
+    max_dt = datetime.fromtimestamp(max_ts, tz=timezone.utc)
+    days = (max_dt - min_dt).days
+    print(
+        f"Date range: {min_dt.strftime('%Y-%m-%d %H:%M:%S')} to "
+        f"{max_dt.strftime('%Y-%m-%d %H:%M:%S')}, {_fmt(days)} day{'s' if days != 1 else ''} span"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,21 +292,16 @@ def estimate_tokens(text: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def track_tokens(
-    model: str,
-    input_tokens: float,
-    output_tokens: float,
-    input_price_per_m: float = 0.0,
-    output_price_per_m: float = 0.0,
-) -> None:
-    """Persist token usage per model to ``token_log.json``."""
+def _track_batch(entries: dict[str, PricePair]) -> None:
+    """Persist multiple model usages to ``token_log.json`` in one write."""
     lock = FileLock(_LOCK_PATH, timeout=10)
     with lock:
         log = _safe_read_json(TOKEN_LOG) or {}
-        if model not in log:
-            log[model] = {"input": 0, "output": 0}
-        log[model]["input"] += input_tokens
-        log[model]["output"] += output_tokens
+        for model, (input_tokens, output_tokens) in entries.items():
+            if model not in log:
+                log[model] = {"input": 0, "output": 0}
+            log[model]["input"] += input_tokens
+            log[model]["output"] += output_tokens
 
         # Write atomically
         tmp = TOKEN_LOG.with_suffix(".tmp")
@@ -167,43 +309,66 @@ def track_tokens(
         tmp.replace(TOKEN_LOG)
 
 
-def get_totals() -> dict[str, dict[str, float]]:
-    """Read and display all tracked token usage with costs."""
+def track_tokens(model: str, input_tokens: float, output_tokens: float) -> None:
+    """Persist token usage per model to ``token_log.json``."""
+    _track_batch({model: (input_tokens, output_tokens)})
+
+
+def get_totals(pricing_file: str | None = None) -> dict[str, TotalsEntry]:
+    """Read and display all tracked token usage with costs.
+
+    *pricing_file* applies the same overrides used by ``scan``.
+    """
     log = _safe_read_json(TOKEN_LOG)
     if not log:
         print("No token log found.")
         return {}
 
-    totals: dict[str, dict[str, float]] = {}
-    for model, data in log.items():
-        input_t = data.get("input", 0)
-        output_t = data.get("output", 0)
-        pricing = _get_pricing(model, {"__default": _DEFAULT_PRICING})
-        input_cost = input_t * pricing[0] / 1_000_000
-        output_cost = output_t * pricing[1] / 1_000_000
-        totals[model] = {
-            "input": input_t,
-            "output": output_t,
-            "input_cost": input_cost,
-            "output_cost": output_cost,
-            "total_cost": input_cost + output_cost,
-        }
+    overrides = _load_pricing_overrides(pricing_file)
+    totals = {
+        model: _priced(
+            data.get("input", 0), data.get("output", 0), _get_pricing(model, overrides)
+        )
+        for model, data in log.items()
+    }
 
-    # Display
-    grand_input = 0.0
-    grand_output = 0.0
-    grand_cost = 0.0
-    rows: list[tuple[str, ...]] = []
-    for model, t in totals.items():
-        rows.append((model, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}"))
-        grand_input += t["input"]
-        grand_output += t["output"]
-        grand_cost += t["total_cost"]
-
-    rows.append(("Total", _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
-    print()
-    _print_table(("Model", "Input", "Output", "Cost"), rows, "<>>>", rule_before=len(rows) - 1)
+    _print_model_table(totals)
     return totals
+
+
+def _resolve_db_path(db_path: str | None) -> Path | None:
+    """Locate the opencode DB; an explicit path wins, else well-known candidates."""
+    if db_path:
+        db = Path(db_path)
+        return db if db.exists() else None
+    candidates = [
+        Path.home() / ".local/share/opencode/opencode.db",
+        Path.home() / "AppData/Roaming/opencode/opencode.db",
+        Path("opencode.db"),
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _opencode_record(data_text: Any, time_created: Any) -> UsageRecord | None:
+    """Turn one ``message`` row into a usage record; None if unusable."""
+    try:
+        data = json.loads(data_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    tokens = data.get("tokens") or {}
+
+    # _parse_model_str() already returns "provider/model_id[/variant]".
+    # Do NOT prepend the provider again (that produced doubled prefixes).
+    key = _parse_model_str(data)
+    return UsageRecord(
+        key,
+        tokens.get("input", 0) or 0,
+        tokens.get("output", 0) or 0,
+        _to_epoch_seconds(time_created),
+    )
 
 
 def scan_opencode_db(
@@ -211,27 +376,15 @@ def scan_opencode_db(
     pricing_file: str | None = None,
     obfuscate: bool = False,
     monthly: bool = True,
-) -> dict[str, dict[str, float]]:
+) -> dict[str, TotalsEntry]:
     """Scan opencode SQLite database and track token usage.
 
     Reads actual ``tokens.input`` / ``tokens.output`` from the ``message`` table.
     Applies pricing from *pricing_file* (with whole-segment fallback matching),
     then ``_DEFAULT_PRICING``.
     """
-    import sqlite3
-
-    # Resolve DB path
-    if db_path:
-        db = Path(db_path)
-    else:
-        candidates = [
-            Path.home() / ".local/share/opencode/opencode.db",
-            Path.home() / "AppData/Roaming/opencode/opencode.db",
-            Path("opencode.db"),
-        ]
-        db = next((p for p in candidates if p.exists()), None)
-
-    if not db or not db.exists():
+    db = _resolve_db_path(db_path)
+    if db is None:
         print("No opencode database found.")
         return {}
 
@@ -240,143 +393,125 @@ def scan_opencode_db(
     # Load pricing
     overrides = _load_pricing_overrides(pricing_file)
 
-    conn = sqlite3.connect(str(db))
+    # Open read-only so a scan can never lock or modify a live opencode.db.
+    conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    records: list[UsageRecord] = []
+    raw_count = 0
     try:
-        cursor = conn.execute("SELECT data, time_created FROM message")
-        rows = cursor.fetchall()
+        for data_text, time_created in conn.execute("SELECT data, time_created FROM message"):
+            raw_count += 1
+            record = _opencode_record(data_text, time_created)
+            if record is not None:
+                records.append(record)
     except sqlite3.OperationalError as exc:
         print(f"Could not read the opencode database: {exc}")
         return {}
     finally:
         conn.close()
 
-    print(f"Scanning {len(rows)} messages from {display_path}...")
+    print(f"Scanning {raw_count} messages from {display_path}...")
 
-    totals: dict[str, dict[str, float]] = {}
-    by_month: dict[str, dict[str, float]] = {}
-    min_time: float | None = None
-    max_time: float | None = None
+    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
 
-    for row in rows:
-        try:
-            data = json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-        tokens = data.get("tokens", {})
-        input_t = tokens.get("input", 0) or 0
-        output_t = tokens.get("output", 0) or 0
-
-        # Skip zero-usage entries
-        if input_t == 0 and output_t == 0:
-            continue
-
-        # _parse_model_str() already returns "provider/model_id[/variant]".
-        # Do NOT prepend the provider again (that produced doubled prefixes).
-        key = _parse_model_str(data)
-
-        if key not in totals:
-            pricing = _get_pricing(key, overrides)
-            totals[key] = {
-                "input": 0.0,
-                "output": 0.0,
-                "input_cost": 0.0,
-                "output_cost": 0.0,
-                "total_cost": 0.0,
-            }
-
-        totals[key]["input"] += input_t
-        totals[key]["output"] += output_t
-
-        # Track timestamps and monthly buckets
-        time_created = row[1]
-        if time_created:
-            ts = float(time_created) / 1000 if len(str(time_created)) > 12 else float(time_created)
-            if min_time is None or ts < min_time:
-                min_time = ts
-            if max_time is None or ts > max_time:
-                max_time = ts
-
-            month_key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
-            if month_key not in by_month:
-                by_month[month_key] = {"input": 0.0, "output": 0.0, "cost": 0.0}
-            row_pricing = _get_pricing(key, overrides)
-            by_month[month_key]["input"] += input_t
-            by_month[month_key]["output"] += output_t
-            by_month[month_key]["cost"] += (input_t * row_pricing[0] + output_t * row_pricing[1]) / 1_000_000
-
-    # Calculate costs and persist
-    grand_input = 0.0
-    grand_output = 0.0
-    grand_cost = 0.0
-    for key, t in totals.items():
-        pricing = _get_pricing(key, overrides)
-        t["input_cost"] = t["input"] * pricing[0] / 1_000_000
-        t["output_cost"] = t["output"] * pricing[1] / 1_000_000
-        t["total_cost"] = t["input_cost"] + t["output_cost"]
-
-        grand_input += t["input"]
-        grand_output += t["output"]
-        grand_cost += t["total_cost"]
-
-        track_tokens(key, t["input"], t["output"])
+    # Persist all models in a single locked read-modify-write.
+    _track_batch({key: (t["input"], t["output"]) for key, t in totals.items()})
 
     # Display per-model results
-    model_rows: list[tuple[str, ...]] = [
-        (key, _fmt(t["input"]), _fmt(t["output"]), f"${t['total_cost']:.2f}")
-        for key, t in totals.items()
-    ]
-    model_rows.append(("Total scanned", _fmt(grand_input), _fmt(grand_output), f"${grand_cost:.2f}"))
-    print()
-    _print_table(("Model", "Input", "Output", "Cost"), model_rows, "<>>>", rule_before=len(model_rows) - 1)
+    _print_model_table(totals, total_label="Total scanned")
 
     # Display monthly breakdown before grand total
     if monthly:
-        month_rows = [
-            (month_key, _fmt(m["input"]), _fmt(m["output"]), f"${m['cost']:.2f}")
-            for month_key, m in sorted(by_month.items())
-        ]
-        if month_rows:
-            print("\nMonthly Breakdown:")
-            _print_table(("Month", "Input", "Output", "Cost"), month_rows)
+        _print_monthly(by_month)
 
     # Date range info
-    if min_time is not None and max_time is not None:
-        min_dt = datetime.fromtimestamp(min_time, tz=timezone.utc)
-        max_dt = datetime.fromtimestamp(max_time, tz=timezone.utc)
-        days = (max_dt - min_dt).days
-        print(
-            f"Date range: {min_dt.strftime('%Y-%m-%d %H:%M:%S')} to "
-            f"{max_dt.strftime('%Y-%m-%d %H:%M:%S')}, {_fmt(days)} day{'s' if days != 1 else ''} span"
-        )
+    _print_date_range(min_ts, max_ts)
 
     return totals
 
 
-def scan_sessions(
-    session_dir: str = ".opencode/sessions",
-    model: str = "local-llm",
-) -> None:
-    """Walk legacy JSON session files, estimate tokens, and track usage."""
-    total_input = 0
-    total_output = 0
+def _pi_record(line: str) -> UsageRecord | None:
+    """Turn one pi session JSONL line into a usage record; None if not applicable.
 
-    for session_path in Path(session_dir).glob("*.json"):
-        data = _safe_read_json(session_path)
-        if not data:
-            print(f"Warning: skipping {session_path}")
-            continue
+    Only assistant messages carry ``usage``; pi's own cost fields are ignored
+    (they are zero for local models) — pricing is applied tracker-side.
+    Cache read/write counts are deliberately excluded from input/output.
+    """
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "message":
+        return None
 
-        for msg in data.get("messages", []):
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                total_input += estimate_tokens(content)
-            elif role == "assistant":
-                total_output += estimate_tokens(content)
+    msg = obj.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return None
 
-    track_tokens(model, total_input, total_output)
-    print(f"Scanned sessions: input={total_input}, output={total_output}")
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    provider = msg.get("provider", "unknown")
+    model = msg.get("model", "unknown")
+    return UsageRecord(
+        f"{provider}/{model}",
+        usage.get("input", 0) or 0,
+        usage.get("output", 0) or 0,
+        _to_epoch_seconds(msg.get("timestamp")),
+    )
+
+
+def scan_pi(
+    sessions_dir: str | None = None,
+    pricing_file: str | None = None,
+    obfuscate: bool = False,
+    monthly: bool = True,
+) -> dict[str, TotalsEntry]:
+    """Scan oh-my-pi session logs and track token usage.
+
+    Reads exact ``usage.input`` / ``usage.output`` from assistant messages in
+    the JSONL transcripts under *sessions_dir* (default ``~/.omp/agent/sessions``,
+    one subdirectory per working directory, ``<ts>_<uuid>.jsonl`` files). Model
+    keys are ``provider/model``, matching the shared pricing-key scheme.
+    """
+    root = Path(sessions_dir) if sessions_dir else Path.home() / ".omp" / "agent" / "sessions"
+    display = "..." + str(root)[-25:] if obfuscate else str(root)
+
+    files = sorted(root.rglob("*.jsonl")) if root.is_dir() else []
+    if not files:
+        print(f"No pi sessions found in {display}.")
+        return {}
+
+    overrides = _load_pricing_overrides(pricing_file)
+
+    records: list[UsageRecord] = []
+    raw_count = 0
+    for path in files:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    raw_count += 1
+                    record = _pi_record(line)
+                    if record is not None:
+                        records.append(record)
+        except OSError:
+            print(f"Warning: skipping {path}")
+
+    print(f"Scanning {len(files)} session files, {raw_count} lines from {display}...")
+
+    totals, by_month, min_ts, max_ts = _aggregate(records, overrides)
+
+    # Persist all models in a single locked read-modify-write.
+    _track_batch({key: (t["input"], t["output"]) for key, t in totals.items()})
+
+    _print_model_table(totals, total_label="Total scanned")
+
+    if monthly:
+        _print_monthly(by_month)
+
+    _print_date_range(min_ts, max_ts)
+
+    return totals
 
 
 def clear_log() -> None:
@@ -403,13 +538,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="totals",
-        choices=["totals", "scan", "scan-json", "clear", "pricing"],
+        choices=["totals", "scan", "scan-pi", "clear", "pricing"],
         help="Command to run (default: totals)",
     )
     parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
-    parser.add_argument("--obfuscate", action="store_true", help="Truncate the DB path in output")
+    parser.add_argument("--obfuscate", action="store_true", help="Truncate the data path in output")
     parser.add_argument("--no-monthly", action="store_true", help="Suppress the monthly breakdown")
     parser.add_argument("--db-path", metavar="PATH", default=None, help="Explicit path to an opencode.db file (scan)")
+    parser.add_argument(
+        "--sessions-dir",
+        metavar="PATH",
+        default=None,
+        help="Directory of pi session logs (default: ~/.omp/agent/sessions)",
+    )
     return parser
 
 
@@ -422,6 +563,7 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
         "obfuscate": ns.obfuscate,
         "monthly": not ns.no_monthly,
         "db_path": ns.db_path,
+        "sessions_dir": ns.sessions_dir,
     }
 
 
@@ -440,25 +582,30 @@ def main(argv: list[str] | None = None) -> None:
             obfuscate=parsed.get("obfuscate", False),
             monthly=parsed.get("monthly", True),
         )
-    elif cmd == "scan-json":
-        scan_sessions()
+    elif cmd == "scan-pi":
+        scan_pi(
+            sessions_dir=parsed.get("sessions_dir"),
+            pricing_file=parsed.get("pricing_file"),
+            obfuscate=parsed.get("obfuscate", False),
+            monthly=parsed.get("monthly", True),
+        )
     elif cmd == "clear":
         clear_log()
     elif cmd == "pricing":
         _list_pricing_options()
     else:
-        get_totals()
+        get_totals(pricing_file=parsed.get("pricing_file"))
 
 
 def _list_pricing_options() -> None:
     """List all available pricing configurations."""
-    print("Available pricing options:\n")
-    print("  1. Use defaults from _KNOWN_MODELS (explicit pricing for cloud providers)")
-    print("  2. Use PRICING_OVERRIDES (configure in the script)")
-    print("  3. Specify a custom pricing file: --pricing-file <path>\n")
+    print("Pricing resolution order (highest to lowest):\n")
+    print("  1. --pricing-file <path>: exact model-key match, then most-specific whole-segment match")
+    print('  2. "_default" key inside the pricing file: fallback within the file')
+    print("  3. Built-in default fallback\n")
 
     print(f"Default (no match): ${_DEFAULT_PRICING[0]:.2f}/M input, ${_DEFAULT_PRICING[1]:.2f}/M output\n")
-    print("To add pricing for a model, use the --pricing-file option or set PRICING_OVERRIDES:\n")
+    print('Pricing file format: {"_default": [in_per_m, out_per_m], "provider/model": [in_per_m, out_per_m]}\n')
 
 
 if __name__ == "__main__":

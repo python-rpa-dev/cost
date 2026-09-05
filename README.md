@@ -1,6 +1,6 @@
 # token_tracker
 
-Track LLM token usage per model with cost estimation. Supports reading from the opencode SQLite database (`opencode.db`) and legacy JSON session files.
+Track LLM token usage per model with cost estimation. Reads real reported usage from the opencode SQLite database (`opencode.db`) and oh-my-pi session logs.
 
 ## Quick Start
 
@@ -23,28 +23,29 @@ python token_tracker.py
 
 | Command | Description |
 |---------|-------------|
-| `python token_tracker.py` | Print per-model totals (input/output tokens + cost) |
+| `python token_tracker.py [totals] [--pricing-file <path>]` | Print per-model totals (input/output tokens + cost) |
 | `python token_tracker.py scan [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
-| `python token_tracker.py scan-json` | Scan legacy JSON session files (`.opencode/sessions/*.json`) |
+| `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
 | `python token_tracker.py pricing` | Describe how pricing is configured and show the default fallback |
 | `python token_tracker.py clear` | Clear the token log file |
 
 ### Options
 
 - `--db-path <path>` — Scan an explicit opencode.db file (default: auto-detect)
-- `--pricing-file <path>` — Use an external JSON file for pricing overrides
-- `--obfuscate` — Truncate the database path in output to the last 25 characters
+- `--sessions-dir <path>` — Directory of pi session logs for `scan-pi` (default: `~/.omp/agent/sessions`)
+- `--pricing-file <path>` — Use an external JSON file for pricing overrides (applies to `totals`, `scan`, and `scan-pi`)
+- `--obfuscate` — Truncate the scanned data path in output to the last 25 characters
 - `--no-monthly` — Suppress the monthly cost breakdown
 
 > A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan`.
 
 ## Data Sources
 
-1. **opencode SQLite database** — Reads actual `tokens.input` / `tokens.output` from the `message` table
-   - Windows: `C:\Users\<user>\AppData\Roaming\ai.opencode.desktop\opencode.global.dat` or `.local/share/opencode/opencode.db`
+1. **opencode SQLite database** — Reads actual `tokens.input` / `tokens.output` from the `message` table (opened read-only)
+   - Windows: `%APPDATA%\opencode\opencode.db`
    - macOS/Linux: `~/.local/share/opencode/opencode.db`
 
-2. **Legacy JSON sessions** — Fallback for older opencode versions (`.opencode/sessions/*.json`)
+2. **oh-my-pi session logs** — Reads exact `usage.input` / `usage.output` from assistant messages in JSONL transcripts under `~/.omp/agent/sessions` (one subdirectory per working directory, `<ts>_<uuid>.jsonl` files)
 
 ## Pricing System
 
@@ -78,4 +79,10 @@ python -m pytest --cov=token_tracker --cov-report=term-missing
 ```bash
 ruff check token_tracker.py
 ruff format token_tracker.py
+```
+
+### Type Checking
+
+```bash
+pyright token_tracker.py tests   # or: make typecheck
 ```

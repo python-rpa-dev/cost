@@ -15,25 +15,27 @@ from token_tracker import (
     _parse_cli_args,
     _parse_model_str,
     _safe_read_json,
-    estimate_tokens,
+    clear_log,
     get_totals,
     main,
     scan_opencode_db,
-    scan_sessions,
+    scan_pi,
     track_tokens,
 )
 
 
-def _make_db(tmp_path, rows):
+def _make_db(tmp_path, rows, timestamps=None):
     """Create a temp opencode-style SQLite DB with the given message rows."""
     db = tmp_path / "opencode.db"
     conn = sqlite3.connect(str(db))
     try:
         conn.execute("CREATE TABLE message (data TEXT, time_created INTEGER)")
-        for r in rows:
+        ts_list = timestamps if timestamps is not None else [1_700_000_000] * len(rows)
+        for r, ts in zip(rows, ts_list):
+            payload = json.dumps(r) if not isinstance(r, str) else r
             conn.execute(
                 "INSERT INTO message (data, time_created) VALUES (?, ?)",
-                (json.dumps(r), 1_700_000_000),
+                (payload, ts),
             )
         conn.commit()
     finally:
@@ -50,22 +52,6 @@ class TestFmt:
 
     def test_zero(self):
         assert _fmt(0) == "0"
-
-
-class TestEstimateTokens:
-    def test_empty_string(self):
-        assert estimate_tokens("") == 0
-
-    def test_single_word(self):
-        assert estimate_tokens("hello") == 1
-
-    def test_multiple_words(self):
-        assert estimate_tokens("hello world foo") == 3
-
-    def test_consistent_ratio(self):
-        text = " ".join(["word"] * 100)
-        tokens = estimate_tokens(text)
-        assert tokens == 130
 
 
 class TestSafeReadJson:
@@ -291,6 +277,14 @@ class TestParseCliArgs:
         assert args["command"] == "scan"
         assert args["db_path"] == "/tmp/x.db"
 
+    def test_scan_pi_flags(self):
+        args = _parse_cli_args(
+            ["token_tracker.py", "scan-pi", "--sessions-dir", "/tmp/s", "--obfuscate"]
+        )
+        assert args["command"] == "scan-pi"
+        assert args["sessions_dir"] == "/tmp/s"
+        assert args["obfuscate"] is True
+
     def test_invalid_command_raises(self):
         with pytest.raises(SystemExit):
             _parse_cli_args(["token_tracker.py", "bogus"])
@@ -317,33 +311,10 @@ class TestMainDispatch:
             main(["token_tracker.py", "pricing"])
         m.assert_called_once()
 
-    def test_dispatch_scan_json(self, capsys):
-        with patch("token_tracker.scan_sessions") as m:
-            main(["token_tracker.py", "scan-json"])
+    def test_dispatch_scan_pi(self, capsys):
+        with patch("token_tracker.scan_pi") as m:
+            main(["token_tracker.py", "scan-pi"])
         m.assert_called_once()
-
-
-class TestScanSessions:
-    def test_scans_session_files(self, tmp_path, capsys):
-        sess = tmp_path / "sessions"
-        sess.mkdir()
-        (sess / "a.json").write_text(
-            json.dumps(
-                {
-                    "messages": [
-                        {"role": "user", "content": "hello world foo bar"},
-                        {"role": "assistant", "content": "hi there"},
-                    ],
-                }
-            )
-        )
-        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
-            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
-        ):
-            scan_sessions(session_dir=str(sess), model="local-llm")
-        data = json.loads((tmp_path / "token_log.json").read_text())
-        assert data["local-llm"]["input"] > 0
-        assert data["local-llm"]["output"] > 0
 
 
 class TestListPricingOptions:
@@ -351,3 +322,168 @@ class TestListPricingOptions:
         _list_pricing_options()
         out = capsys.readouterr().out
         assert "pricing" in out.lower()
+
+    def test_no_stale_identifiers(self, capsys):
+        _list_pricing_options()
+        out = capsys.readouterr().out
+        # These names never existed in the code; help must not mention them.
+        assert "_KNOWN_MODELS" not in out
+        assert "PRICING_OVERRIDES" not in out
+
+
+class TestClearLog:
+    def test_clear_removes_file(self, tmp_path, capsys):
+        log_file = tmp_path / "token_log.json"
+        log_file.write_text("{}")
+        with patch("token_tracker.TOKEN_LOG", log_file):
+            clear_log()
+        assert not log_file.exists()
+        assert "cleared" in capsys.readouterr().out.lower()
+
+    def test_clear_noop(self, tmp_path, capsys):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "missing.json"):
+            clear_log()
+        assert "no token log" in capsys.readouterr().out.lower()
+
+
+class TestGetTotalsPricingFile:
+    def test_totals_honor_pricing_file(self, tmp_path):
+        log_file = tmp_path / "token_log.json"
+        log_file.write_text(json.dumps({"openai/gpt-4o": {"input": 1_000_000, "output": 0}}))
+        pricing = tmp_path / "pricing.json"
+        pricing.write_text(json.dumps({"openai/gpt-4o": [2.0, 10.0]}))
+        with patch("token_tracker.TOKEN_LOG", log_file):
+            result = get_totals(pricing_file=str(pricing))
+        assert result["openai/gpt-4o"]["input_cost"] == pytest.approx(2.0)
+
+
+class TestScanRobustness:
+    def _scan(self, tmp_path, db, **kw):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            return scan_opencode_db(db_path=str(db), **kw)
+
+    def test_malformed_and_non_dict_rows_skipped(self, tmp_path):
+        db = _make_db(
+            tmp_path,
+            rows=[
+                "{not json{{{",  # raw invalid JSON text
+                '"just a string"',  # valid JSON but not an object
+                {"providerID": "p", "id": "m", "tokens": None},  # null tokens
+                {"providerID": "p", "id": "m2", "tokens": {"input": 10, "output": 5}},
+            ],
+        )
+        result = self._scan(tmp_path, db, monthly=False)
+        assert list(result) == ["p/m2"]
+
+    def test_zero_usage_rows_skipped(self, tmp_path):
+        db = _make_db(
+            tmp_path,
+            rows=[{"providerID": "p", "id": "m", "tokens": {"input": 0, "output": 0}}],
+        )
+        assert self._scan(tmp_path, db, monthly=False) == {}
+
+    def test_monthly_breakdown_and_millis_timestamps(self, tmp_path, capsys):
+        good = {"providerID": "p", "id": "m", "tokens": {"input": 1000, "output": 500}}
+        db = _make_db(
+            tmp_path,
+            rows=[good, good],
+            timestamps=[1_700_000_000, 1_700_000_000_000],  # seconds and millis of one instant
+        )
+        result = self._scan(tmp_path, db)
+        out = capsys.readouterr().out
+        assert "Monthly Breakdown:" in out
+        month_lines = [line for line in out.splitlines() if line.startswith("2023-")]
+        assert len(month_lines) == 1  # seconds and millis rows merged into one bucket
+        assert result["p/m"]["input"] == 2000
+
+
+def _pi_line(provider, model, input_t, output_t, ts=1_700_000_000_000):
+    """One assistant-message JSONL line with the given usage."""
+    return json.dumps(
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "provider": provider,
+                "model": model,
+                "usage": {"input": input_t, "output": output_t},
+                "timestamp": ts,
+            },
+        }
+    )
+
+
+def _write_pi_session(tmp_path, name, lines):
+    """Write a pi-style sessions tree; returns the sessions root."""
+    session_dir = tmp_path / "sessions" / f"--{name}--"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return tmp_path / "sessions"
+
+
+class TestScanPi:
+    def _scan(self, tmp_path, root, **kw):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "token_log.json.lock")
+        ):
+            return scan_pi(sessions_dir=str(root), **kw)
+
+    def test_no_sessions(self, tmp_path, capsys):
+        result = self._scan(tmp_path, tmp_path / "missing")
+        assert result == {}
+        assert "No pi sessions" in capsys.readouterr().out
+
+    def test_aggregates_across_files(self, tmp_path):
+        root = tmp_path / "sessions"
+        _write_pi_session(root.parent, "proj-a", [_pi_line("lmstudio", "qwen/x@q8", 1000, 500)])
+        # second project dir under the same root
+        proj_b = root / "--proj-b--"
+        proj_b.mkdir(parents=True)
+        (proj_b / "t.jsonl").write_text(
+            "\n".join(
+                [_pi_line("lmstudio", "qwen/x@q8", 2000, 300), _pi_line("openai", "gpt-4o", 100, 40)]
+            )
+            + "\n"
+        )
+        result = self._scan(tmp_path, root, monthly=False)
+        assert result["lmstudio/qwen/x@q8"]["input"] == 3000
+        assert result["lmstudio/qwen/x@q8"]["output"] == 800
+        assert result["openai/gpt-4o"]["input"] == 100
+
+    def test_skips_malformed_non_assistant_and_zero(self, tmp_path):
+        root = _write_pi_session(
+            tmp_path,
+            "p",
+            [
+                "{not json",  # malformed line
+                json.dumps({"type": "session", "cwd": "/x"}),  # header record
+                json.dumps({"type": "message", "message": {"role": "user", "content": []}}),
+                _pi_line("p", "m-zero", 0, 0),  # zero usage on both sides
+                _pi_line("p", "m-ok", 10, 5),
+            ],
+        )
+        result = self._scan(tmp_path, root, monthly=False)
+        assert list(result) == ["p/m-ok"]
+
+    def test_pricing_file_and_monthly(self, tmp_path, capsys):
+        root = _write_pi_session(
+            tmp_path, "p", [_pi_line("lmstudio", "qwen/y", 1_000_000, 1_000_000)]
+        )
+        pricing = tmp_path / "pricing.json"
+        pricing.write_text(json.dumps({"lmstudio": [2.0, 4.0]}))
+        result = self._scan(tmp_path, root, pricing_file=str(pricing))
+        t = result["lmstudio/qwen/y"]
+        # Provider-prefix override must win: 1M tokens at $2/$4 per million.
+        assert t["input_cost"] == pytest.approx(2.0)
+        assert t["output_cost"] == pytest.approx(4.0)
+        out = capsys.readouterr().out
+        assert "Monthly Breakdown:" in out
+        assert any(line.startswith("2023-") for line in out.splitlines())
+
+    def test_persists_to_log(self, tmp_path):
+        root = _write_pi_session(tmp_path, "p", [_pi_line("prov", "mdl", 700, 300)])
+        self._scan(tmp_path, root, monthly=False)
+        data = json.loads((tmp_path / "token_log.json").read_text())
+        assert data["prov/mdl"] == {"input": 700, "output": 300}

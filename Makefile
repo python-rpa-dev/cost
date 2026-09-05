@@ -1,6 +1,6 @@
 PY = .venv-linux/bin/python
 
-.PHONY: install test lint check
+.PHONY: install test lint typecheck check
 
 install:
 	$(PY) -m pip install -e ".[dev]" vulture
@@ -12,4 +12,7 @@ lint:
 	.venv-linux/bin/ruff check .
 	.venv-linux/bin/vulture
 
-check: lint test
+typecheck:
+	.venv-linux/bin/pyright token_tracker.py tests
+
+check: lint typecheck test
