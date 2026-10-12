@@ -7,7 +7,7 @@ A module that tracks LLM token usage per model, persisted to a local JSON file. 
 ## API
 
 ### `track_tokens(model: str, input_tokens: float, output_tokens: float)`
-Persist raw token counts per model to `data/token_log.json`. Pricing is applied at display time (see pricing resolution), never stored. Manual entries coexist with scanner watermarks under the `_meta` key, which readers must ignore.
+Persist raw token counts per model to `data/token_log.json`. Pricing is applied at display time (see pricing resolution), never stored. Manual entries coexist with scanner watermarks under the `_meta` key, which readers must ignore. Every write stamps `_meta.schema` (currently `1`); absent means a pre-0.5 ledger, and readers must tolerate unknown versions by ignoring unrecognized `_meta` keys.
 
 ### `get_totals(pricing_file: str | None = None)`
 Print per-model and aggregate input/output token totals, plus cost as an aligned table (`Model / Input / Output / Cost`) with a separator rule before the `Total` row. When the ledger carries month buckets (written by every scan under `_meta.months`, regardless of `--no-monthly`), a cumulative monthly breakdown is printed below — reports stay available without re-scanning.

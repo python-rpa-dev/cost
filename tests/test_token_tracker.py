@@ -8,6 +8,7 @@ import pytest
 
 from token_tracker import (
     _DEFAULT_PRICING,
+    _LEDGER_SCHEMA,
     _detect_env,
     _fmt,
     _get_pricing,
@@ -776,3 +777,39 @@ class TestLedgerMonthly:
         with patch("token_tracker.TOKEN_LOG", log):
             get_totals()
         assert "Monthly Breakdown:" not in capsys.readouterr().out
+
+
+class TestLedgerSchema:
+    """Every write stamps ``_meta.schema``; readers tolerate unknown versions."""
+
+    def test_scan_stamps_schema(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 10, "output": 1}}
+        db = _make_db(tmp_path, [row])
+        log = tmp_path / "data" / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            scan_opencode_db(db_path=str(db), env="t")
+        data = json.loads(log.read_text())
+        assert data["_meta"]["schema"] == _LEDGER_SCHEMA
+
+    def test_track_tokens_stamps_schema(self, tmp_path):
+        log = tmp_path / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            track_tokens("p/m", 10, 1)
+        data = json.loads(log.read_text())
+        assert data["_meta"]["schema"] == _LEDGER_SCHEMA
+        assert data["p/m"] == {"input": 10, "output": 1}
+
+    def test_unknown_future_schema_still_readable(self, tmp_path, capsys):
+        log = tmp_path / "token_log.json"
+        log.write_text(json.dumps({
+            "p/m": {"input": 1_000_000, "output": 500_000},
+            "_meta": {"schema": 99, "months": {"2023-01": {"p/m": [1_000_000, 500_000]}}},
+        }))
+        with patch("token_tracker.TOKEN_LOG", log):
+            get_totals()
+        out = capsys.readouterr().out
+        assert "Monthly Breakdown:" in out and "2023-01" in out

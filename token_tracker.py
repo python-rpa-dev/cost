@@ -21,6 +21,10 @@ _LOCK_PATH = str(TOKEN_LOG) + ".lock"
 
 
 _DEFAULT_PRICING: tuple[float, float] = (0.03, 0.05)
+#: Ledger format version, written to ``_meta.schema`` on every write.
+#: Absent means a pre-0.5 ledger (watermark + months only). Readers must
+#: ignore unknown ``_meta`` keys; future migrations key off this value.
+_LEDGER_SCHEMA = 1
 
 #: ``(input_price_per_million, output_price_per_million)``.
 PricePair = tuple[float, float]
@@ -306,6 +310,7 @@ def _scan_report(
             meta = log.setdefault("_meta", {})
             marks = meta.setdefault("watermark", {}) if isinstance(meta, dict) else None
             if isinstance(marks, dict):
+                meta["schema"] = _LEDGER_SCHEMA
                 for src, ts in new_marks.items():
                     prev = marks.get(src)
                     if not isinstance(prev, (int, float)) or isinstance(prev, bool) or ts > prev:
@@ -469,6 +474,9 @@ def _track_batch(entries: dict[str, PricePair]) -> None:
             if isinstance(entry, dict):
                 entry["input"] += input_tokens
                 entry["output"] += output_tokens
+        meta = log.setdefault("_meta", {})
+        if isinstance(meta, dict):
+            meta["schema"] = _LEDGER_SCHEMA
         _write_log(log)
 
 
