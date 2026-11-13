@@ -268,10 +268,11 @@ def _scan_report(
 
     Only records newer than the per-source watermark stored under ``_meta`` in
     the ledger are tracked, so re-scanning never double-counts; each source's
-    watermark advances to its newest persisted timestamp. Records without a
-    timestamp count once, on the first scan of their source. *since_ts* and
-    *until_ts* restrict tracking to a UTC epoch-seconds window (start
-    inclusive, end exclusive).
+    watermark advances to its newest persisted timestamp; a windowed scan
+    (*since_ts*/*until_ts*, UTC epoch seconds, start inclusive, end exclusive)
+    never advances watermarks, so a later full scan still picks up records the
+    window skipped — at the cost of re-counting records inside the window.
+    Records without a timestamp count once, on the first scan of their source.
 
     The ledger is persisted per model (sources merged); the table carries a
     Source column so combined scans stay attributable.
@@ -288,7 +289,13 @@ def _scan_report(
         skipped: dict[str, int] = {}
         for rec in records:
             watermark = watermarks.get(rec.source)
-            if rec.ts is not None and watermark is not None and rec.ts <= watermark:
+            if rec.ts is None:
+                # No timestamp to gate on: count once, on the source's first scan.
+                if rec.source in watermarks:
+                    skipped[rec.source] = skipped.get(rec.source, 0) + 1
+                else:
+                    fresh.append(rec)
+            elif watermark is not None and rec.ts <= watermark:
                 skipped[rec.source] = skipped.get(rec.source, 0) + 1
             else:
                 fresh.append(rec)
@@ -306,6 +313,15 @@ def _scan_report(
         for rec in fresh:
             if rec.ts is not None:
                 new_marks[rec.source] = max(new_marks.get(rec.source, rec.ts), rec.ts)
+            else:
+                # Undated records count once per source: mark the source seen.
+                new_marks.setdefault(rec.source, 0)
+        # A windowed scan never saw the source's full history, so it must not
+        # advance watermarks: records below the window were never tracked and a
+        # later full scan would skip them forever. Re-counting inside the window
+        # on a later full scan is the accepted cost.
+        if since_ts is not None or until_ts is not None:
+            new_marks = {}
         if changed or new_marks:
             meta = log.setdefault("_meta", {})
             marks = meta.setdefault("watermark", {}) if isinstance(meta, dict) else None
@@ -654,8 +670,8 @@ def scan_opencode_db(
     defaults to auto-detection: ``wsl``/``windows``/``local``) so each OS's own
     database keeps an independent watermark in a shared ledger. Only usage
     newer than that watermark is tracked; *since_ts*/*until_ts* bound a UTC
-    epoch-seconds window (start inclusive, end exclusive). Returns the newly
-    tracked totals.
+    epoch-seconds window (start inclusive, end exclusive) and never advance
+    the watermark. Returns the newly tracked totals.
     """
     records = _collect_opencode(db_path, obfuscate)
     if records is None:
@@ -745,7 +761,8 @@ def scan_pi(
     are tagged ``oh-my-pi@<env>`` (see :func:`scan_opencode_db`); each OS's own
     session directory keeps an independent watermark. Only usage newer than
     that watermark is tracked; *since_ts*/*until_ts* bound a UTC epoch-seconds
-    window (start inclusive, end exclusive). Returns the newly tracked totals.
+    window (start inclusive, end exclusive) and never advance the watermark.
+    Returns the newly tracked totals.
     """
     records = _collect_pi(sessions_dir, obfuscate)
     if records is None:
@@ -774,9 +791,9 @@ def scan_all(
     :func:`scan_opencode_db`), so scans from several environments aggregate
     into one ledger with independent watermarks per source *and* environment.
     Only usage newer than each watermark is tracked (*since_ts*/*until_ts*
-    additionally bound a UTC epoch-seconds window). Returns newly tracked
-    totals keyed by ``(source@env, model)``; the ledger persists per model
-    (sources merged).
+    additionally bound a UTC epoch-seconds window and never advance the
+    watermarks). Returns newly tracked totals keyed by ``(source@env, model)``;
+    the ledger persists per model (sources merged).
     """
     records: list[UsageRecord] = []
     found = False

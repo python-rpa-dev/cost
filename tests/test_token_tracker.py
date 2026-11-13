@@ -602,6 +602,27 @@ class TestWatermark:
         got = self._scan(tmp_path, db_path=str(db), since_ts=500)
         assert got["p/m"]["input"] == 100
 
+    def test_windowed_scan_does_not_poison_watermark(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 10, "output": 1}}
+        db = _make_db(
+            tmp_path, [dict(row) for _ in range(6)], timestamps=[100, 200, 300, 400, 500, 600]
+        )
+        # Backfill only the tail of history first (windowed scan).
+        assert self._scan(tmp_path, db_path=str(db), since_ts=500)["p/m"]["input"] == 20
+        # A later full scan must still pick up the records the window skipped.
+        assert self._scan(tmp_path, db_path=str(db))["p/m"]["input"] == 60
+        # 20 + 60: windowed rows recount (accepted cost) instead of older rows
+        # being skipped forever.
+        assert self._log(tmp_path)["p/m"]["input"] == 80
+        assert self._log(tmp_path)["_meta"]["watermark"]["opencode@t"] == 600
+
+    def test_undated_records_count_once(self, tmp_path):
+        row = {"providerID": "p", "id": "m", "tokens": {"input": 100, "output": 5}}
+        db = _make_db(tmp_path, [row], timestamps=[None])
+        assert self._scan(tmp_path, db_path=str(db))["p/m"]["input"] == 100
+        assert self._scan(tmp_path, db_path=str(db)) == {}
+        assert self._log(tmp_path)["p/m"]["input"] == 100
+
     def test_get_totals_ignores_meta(self, tmp_path, capsys):
         log = tmp_path / "data" / "token_log.json"
         log.parent.mkdir()
