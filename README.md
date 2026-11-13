@@ -40,7 +40,7 @@ python token_tracker.py
 - `--since YYYY-MM-DD` / `--until YYYY-MM-DD` - Track only usage within a UTC date window, both ends inclusive (`scan-oc`/`scan-pi`/`scan-all`)
 - `--env NAME` - Environment label appended to scan sources and watermarks (default: auto-detect `wsl`/`windows`/`local`)
 
-Scans are idempotent per source *and* environment: each records only usage newer than its watermark (`opencode@wsl`, `oh-my-pi@windows`, …) stored under `_meta` in `data/token_log.json`. Running scans from WSL and Windows against the same repo folder aggregates both environments into one ledger without double-counting; the Source column shows which environment produced each row. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history.
+Scans are idempotent per source *and* environment: each records only usage newer than its watermark (`opencode@wsl`, `oh-my-pi@windows`, …) stored under `_meta` in `data/token_log.json`. Running scans from WSL and Windows against the same repo folder aggregates both environments into one ledger without double-counting; the Source column shows which environment produced each row. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history. Repeated scans stay fast: pi session files untouched since the last full scan are skipped without being read.
 
 > A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan-all`.
 

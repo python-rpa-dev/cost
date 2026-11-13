@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,8 +154,12 @@ def _get_pricing(model_key: str, overrides: dict[str, PricePair]) -> PricePair:
         return overrides[model_key]
 
     model_parts = model_key.split("/")
-    best_key: str | None = None
-    best_len = -1
+
+    def rank(key: str) -> tuple[int, int, str]:
+        parts = key.split("/")
+        return (len(parts), len(key), key)
+
+    matches = []
     for key in overrides:
         if key.startswith(_DEFAULT_KEY):
             continue
@@ -163,11 +168,15 @@ def _get_pricing(model_key: str, overrides: dict[str, PricePair]) -> PricePair:
             k == m for k, m in zip(key_parts, model_parts)
         )
         is_contained = all(k in model_parts for k in key_parts)
-        if (is_prefix or is_contained) and len(key_parts) > best_len:
-            best_key, best_len = key, len(key_parts)
+        if is_prefix or is_contained:
+            matches.append(key)
 
-    if best_key is not None:
-        return overrides[best_key]
+    if matches:
+        best = max(matches, key=rank)
+        best_segs = len(best.split("/"))
+        if sum(1 for k in matches if len(k.split("/")) == best_segs) > 1:
+            print(f"Warning: ambiguous pricing for {model_key}; using {best!r}.")
+        return overrides[best]
     return overrides.get(_DEFAULT_KEY, _DEFAULT_PRICING)
 
 
@@ -263,6 +272,7 @@ def _scan_report(
     monthly: bool,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    scan_started: float | None = None,
 ) -> dict[tuple[str, str], TotalsEntry]:
     """Aggregate, persist, and render one scan; totals keyed by ``(source, model)``.
 
@@ -316,13 +326,21 @@ def _scan_report(
             else:
                 # Undated records count once per source: mark the source seen.
                 new_marks.setdefault(rec.source, 0)
+        new_scans: dict[str, float] = {}
+        if scan_started is None:
+            scan_started = time.time()
         # A windowed scan never saw the source's full history, so it must not
         # advance watermarks: records below the window were never tracked and a
         # later full scan would skip them forever. Re-counting inside the window
         # on a later full scan is the accepted cost.
         if since_ts is not None or until_ts is not None:
             new_marks = {}
-        if changed or new_marks:
+        else:
+            # Full scan: every file/row was read at scan_started, so later
+            # collectors may skip sources untouched since then (_meta.last_scan).
+            for src in {rec.source for rec in records}:
+                new_scans[src] = scan_started
+        if changed or new_marks or new_scans:
             meta = log.setdefault("_meta", {})
             marks = meta.setdefault("watermark", {}) if isinstance(meta, dict) else None
             if isinstance(marks, dict):
@@ -331,6 +349,9 @@ def _scan_report(
                     prev = marks.get(src)
                     if not isinstance(prev, (int, float)) or isinstance(prev, bool) or ts > prev:
                         marks[src] = ts
+                scans = meta.setdefault("last_scan", {})
+                if isinstance(scans, dict):
+                    scans.update(new_scans)
                 buckets = meta.setdefault("months", {})
                 if isinstance(buckets, dict):
                     _accumulate_months(buckets, fresh)
@@ -673,13 +694,14 @@ def scan_opencode_db(
     epoch-seconds window (start inclusive, end exclusive) and never advance
     the watermark. Returns the newly tracked totals.
     """
+    t0 = time.time()  # before collection: writes after this stamp stay visible
     records = _collect_opencode(db_path, obfuscate)
     if records is None:
         return {}
 
     records = _tag_env(records, env or _detect_env())
     overrides = _load_pricing_overrides(pricing_file)
-    totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
+    totals = _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
     return {model: t for (_src, model), t in totals.items()}
 
 
@@ -716,8 +738,14 @@ def _pi_record(line: str) -> UsageRecord | None:
     )
 
 
-def _collect_pi(sessions_dir: str | None, obfuscate: bool) -> list[UsageRecord] | None:
-    """Gather usage records from pi session logs; None if no source is present."""
+def _collect_pi(sessions_dir: str | None, obfuscate: bool, env_label: str) -> list[UsageRecord] | None:
+    """Gather usage records from pi session logs; None if no source is present.
+
+    Files whose modification time predates the source's last full scan
+    (``_meta.last_scan``) were already read completely at that time, so they
+    are skipped without reading — steady-state scans only touch freshly
+    written sessions.
+    """
     root = Path(sessions_dir) if sessions_dir else Path.home() / ".omp" / "agent" / "sessions"
     display = "..." + str(root)[-25:] if obfuscate else str(root)
 
@@ -725,6 +753,22 @@ def _collect_pi(sessions_dir: str | None, obfuscate: bool) -> list[UsageRecord] 
     if not files:
         print(f"No pi sessions found in {display}.")
         return None
+
+    meta = (_safe_read_json(TOKEN_LOG) or {}).get("_meta")
+    scans = meta.get("last_scan") if isinstance(meta, dict) else None
+    cutoff = scans.get(f"oh-my-pi@{env_label}") if isinstance(scans, dict) else None
+    skipped_files = 0
+    if isinstance(cutoff, (int, float)) and not isinstance(cutoff, bool):
+        fresh_files = []
+        for path in files:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = float("inf")  # unreadable stat: read the file, let the gate decide
+            if mtime > cutoff:
+                fresh_files.append(path)
+        skipped_files = len(files) - len(fresh_files)
+        files = fresh_files
 
     records: list[UsageRecord] = []
     raw_count = 0
@@ -739,7 +783,8 @@ def _collect_pi(sessions_dir: str | None, obfuscate: bool) -> list[UsageRecord] 
         except OSError:
             print(f"Warning: skipping {path}")
 
-    print(f"Scanning {len(files)} session files, {raw_count} lines from {display}...")
+    note = f" ({skipped_files} unchanged since last scan)" if skipped_files else ""
+    print(f"Scanning {len(files)} session files, {raw_count} lines from {display}{note}...")
     return records
 
 
@@ -764,13 +809,15 @@ def scan_pi(
     window (start inclusive, end exclusive) and never advance the watermark.
     Returns the newly tracked totals.
     """
-    records = _collect_pi(sessions_dir, obfuscate)
+    t0 = time.time()  # before collection: writes after this stamp stay visible
+    env_label = env or _detect_env()
+    records = _collect_pi(sessions_dir, obfuscate, env_label)
     if records is None:
         return {}
 
-    records = _tag_env(records, env or _detect_env())
+    records = _tag_env(records, env_label)
     overrides = _load_pricing_overrides(pricing_file)
-    totals = _scan_report(records, overrides, monthly, since_ts, until_ts)
+    totals = _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
     return {model: t for (_src, model), t in totals.items()}
 
 
@@ -798,12 +845,13 @@ def scan_all(
     records: list[UsageRecord] = []
     found = False
     env_label = env or _detect_env()
+    t0 = time.time()  # before collection: writes after this stamp stay visible
 
     oc_records = _collect_opencode(db_path, obfuscate)
     if oc_records is not None:
         records.extend(_tag_env(oc_records, env_label))
         found = True
-    pi_records = _collect_pi(sessions_dir, obfuscate)
+    pi_records = _collect_pi(sessions_dir, obfuscate, env_label)
     if pi_records is not None:
         records.extend(_tag_env(pi_records, env_label))
         found = True
@@ -813,7 +861,7 @@ def scan_all(
         return {}
 
     overrides = _load_pricing_overrides(pricing_file)
-    return _scan_report(records, overrides, monthly, since_ts, until_ts)
+    return _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
 
 
 def clear_log() -> None:
@@ -914,43 +962,43 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "scan-oc":
         scan_opencode_db(
-            db_path=parsed.get("db_path"),
-            pricing_file=parsed.get("pricing_file"),
-            obfuscate=parsed.get("obfuscate", False),
-            monthly=parsed.get("monthly", True),
-            since_ts=parsed.get("since_ts"),
-            until_ts=parsed.get("until_ts"),
-            env=parsed.get("env"),
+            db_path=parsed["db_path"],
+            pricing_file=parsed["pricing_file"],
+            obfuscate=parsed["obfuscate"],
+            monthly=parsed["monthly"],
+            since_ts=parsed["since_ts"],
+            until_ts=parsed["until_ts"],
+            env=parsed["env"],
         )
     elif cmd == "scan-pi":
         scan_pi(
-            sessions_dir=parsed.get("sessions_dir"),
-            pricing_file=parsed.get("pricing_file"),
-            obfuscate=parsed.get("obfuscate", False),
-            monthly=parsed.get("monthly", True),
-            since_ts=parsed.get("since_ts"),
-            until_ts=parsed.get("until_ts"),
-            env=parsed.get("env"),
+            sessions_dir=parsed["sessions_dir"],
+            pricing_file=parsed["pricing_file"],
+            obfuscate=parsed["obfuscate"],
+            monthly=parsed["monthly"],
+            since_ts=parsed["since_ts"],
+            until_ts=parsed["until_ts"],
+            env=parsed["env"],
         )
     elif cmd == "scan-all":
         scan_all(
-            db_path=parsed.get("db_path"),
-            sessions_dir=parsed.get("sessions_dir"),
-            pricing_file=parsed.get("pricing_file"),
-            obfuscate=parsed.get("obfuscate", False),
-            monthly=parsed.get("monthly", True),
-            since_ts=parsed.get("since_ts"),
-            until_ts=parsed.get("until_ts"),
-            env=parsed.get("env"),
+            db_path=parsed["db_path"],
+            sessions_dir=parsed["sessions_dir"],
+            pricing_file=parsed["pricing_file"],
+            obfuscate=parsed["obfuscate"],
+            monthly=parsed["monthly"],
+            since_ts=parsed["since_ts"],
+            until_ts=parsed["until_ts"],
+            env=parsed["env"],
         )
     elif cmd == "clear":
         clear_log()
     elif cmd == "pricing":
-        _list_pricing_options(parsed.get("pricing_file"))
+        _list_pricing_options(parsed["pricing_file"])
     elif cmd == "export":
-        export_csv(pricing_file=parsed.get("pricing_file"))
+        export_csv(pricing_file=parsed["pricing_file"])
     else:
-        get_totals(pricing_file=parsed.get("pricing_file"))
+        get_totals(pricing_file=parsed["pricing_file"])
 
 
 def _list_pricing_options(pricing_file: str | None = None) -> None:

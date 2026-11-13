@@ -18,7 +18,7 @@ Read actual token counts from the opencode SQLite database. Auto-detects the DB 
 Scan output format: a first line reporting message count and source path (`Scanning <N> messages from <path>...`), then the usage table with a leading `Source` column (`Source / Model / Input / Output / Cost`; values like `opencode@wsl`; grand-total row labeled `Total scanned`), an optional monthly breakdown (`Month / Input / Output / Cost`), and a date-range line. Already-tracked records are reported per source-and-environment (`Skipped N already-tracked record(s) from opencode@wsl.`); when nothing is new, the scan prints `No new usage to track.` and renders no table.
 
 ### `scan_pi(sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True, since_ts: float | None = None, until_ts: float | None = None, env: str | None = None)`
-Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently. Tagged `oh-my-pi@<env>`; watermark and window semantics identical to `scan_opencode_db`.
+Read exact token counts (`usage.input` / `usage.output`) from assistant messages in oh-my-pi JSONL session logs (default `~/.omp/agent/sessions`, one subdirectory per working directory, `<ts>_<uuid>.jsonl` files). Model keys are `provider/model`. pi's own cost fields are ignored — pricing follows the shared rules. Unreadable files are skipped with a warning; malformed lines silently. Tagged `oh-my-pi@<env>`; watermark and window semantics identical to `scan_opencode_db`. Steady-state scans skip files whose mtime predates the source's last full scan (`_meta.last_scan`, stamped before collection so writes during a scan stay visible); the scan line then reports e.g. `Scanning 3 session files, 412 lines from <path> (17 unchanged since last scan)...`.
 
 ### `scan_all(db_path: str | None = None, sessions_dir: str | None = None, pricing_file: str | None = None, obfuscate: bool = False, monthly: bool = True, since_ts: float | None = None, until_ts: float | None = None, env: str | None = None)`
 Scan every known client source (opencode DB + oh-my-pi session logs) and render one combined table with a Source column. Missing sources are reported and skipped. Watermarks advance independently per `source@env`, so scans from several environments aggregate into one ledger. Returns newly tracked totals keyed by `(source@env, model)`; the ledger persists per model (sources merged).
@@ -53,7 +53,7 @@ Format number with apostrophe delimiter (e.g. `1'234'567`).
 ## Pricing System
 
 ### Priority Order (highest to lowest)
-1. `--pricing-file <path>` — external JSON file with model pricing (exact key match, then most-specific whole-segment match)
+1. `--pricing-file <path>` — external JSON file with model pricing (exact key match, then most-specific whole-segment match; equal-specificity ties resolve to the longer key and print an ambiguity warning)
 2. `_default` key in the pricing file — fallback within the file when no key matches
 3. `_DEFAULT_PRICING` — built-in fallback when nothing else matches (default: `(0.03, 0.05)` = `$0.03/M input, $0.05/M output`)
 

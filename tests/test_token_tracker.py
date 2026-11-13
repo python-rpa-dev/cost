@@ -1,6 +1,7 @@
 """Tests for token_tracker module."""
 
 import json
+import os
 import sqlite3
 from unittest.mock import patch
 
@@ -133,6 +134,13 @@ class TestGetPricing:
         # A single-segment override matches if it appears as a whole segment.
         overrides = {"qwen": (5.0, 6.0)}
         assert _get_pricing("lmstudio_remote/qwen/qwen3.6-35b-a3b", overrides) == (5.0, 6.0)
+
+    def test_tie_prefers_longer_key_and_warns(self, capsys):
+        # Equal segment counts: the longer key wins deterministically (not by
+        # file order) and the ambiguity is surfaced.
+        overrides = {"beta": (2.0, 2.0), "alpha": (1.0, 1.0)}
+        assert _get_pricing("alpha/beta/x", overrides) == (1.0, 1.0)
+        assert "ambiguous pricing for alpha/beta/x" in capsys.readouterr().out
 
     def test_no_substring_false_positive(self):
         # "gpt" must NOT match "gpt2" (whole-segment matching, not substring).
@@ -743,6 +751,36 @@ class TestEnvTagging:
     def test_env_cli_flag(self):
         args = _parse_cli_args(["token_tracker.py", "scan-all", "--env", "desktop"])
         assert args["env"] == "desktop"
+
+
+class TestPiMtimePrefilter:
+    """Steady-state pi scans must skip files unchanged since the last full scan."""
+
+    def _scan(self, tmp_path, root, **kw):
+        log = tmp_path / "token_log.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            return scan_pi(sessions_dir=str(root), env="t", **kw)
+
+    def test_unchanged_files_skipped(self, tmp_path, capsys):
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("p", "m", 100, 5)])
+        f = next(root.rglob("*.jsonl"))
+        assert self._scan(tmp_path, root, monthly=False)["p/m"]["input"] == 100
+        os.utime(f, (1_600_000_000, 1_600_000_000))  # older than the last full scan
+        assert self._scan(tmp_path, root, monthly=False) == {}
+        out = capsys.readouterr().out
+        assert "Scanning 0 session files" in out and "1 unchanged since last scan" in out
+
+    def test_modified_file_reread(self, tmp_path):
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("p", "m", 100, 5)])
+        f = next(root.rglob("*.jsonl"))
+        self._scan(tmp_path, root, monthly=False)
+        with f.open("a") as fh:
+            fh.write(_pi_line("p", "m", 50, 2, ts=1_700_000_001_000) + "\n")
+        os.utime(f, None)  # fresh mtime: newer than the last full scan
+        got = self._scan(tmp_path, root, monthly=False)
+        assert got["p/m"]["input"] == 50
 
 
 class TestLedgerMonthly:
