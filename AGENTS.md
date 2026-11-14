@@ -12,7 +12,7 @@
 
 ## Domain gotchas
 - Pricing is NEVER stored in the ledger; costs are computed at display time so price changes reprice history.
-- The ledger (`data/token_log.json`) carries `_meta` (`schema`, `watermark`, `months`). Readers must ignore unknown `_meta` keys and any top-level key starting with `_`. On a format change, bump `_LEDGER_SCHEMA` in `token_tracker.py` and update `adr.md`.
+- The ledger (`data/token_log.json`) carries `_meta` (`schema`, `watermark`, `months`, `last_scan`, `merged`). Readers must ignore unknown `_meta` keys and any top-level key starting with `_`. On a format change, bump `_LEDGER_SCHEMA` in `token_tracker.py` and update `adr.md`.
 - `adr.md` must stay current AND mirrored to the codebase-memory graph (MCP `manage_adr`, project `home-developer-projekte-cost`, content = adr.md minus the leading HTML-comment mirror lines).
 - opencode.db is foreign data: open read-only (`mode=ro` URI), never write to it; degrade gracefully on malformed rows instead of crashing.
 - Model keys come from harness data and drift over time (`lmstudio_remote/...` vs `lm-studio-remote/...`); pricing falls back via whole-segment match, then `_default`.

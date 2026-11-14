@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -10,10 +11,12 @@ import pytest
 from token_tracker import (
     _DEFAULT_PRICING,
     _LEDGER_SCHEMA,
+    Location,
     _detect_env,
     _fmt,
     _get_pricing,
     _list_pricing_options,
+    _load_locations,
     _load_pricing_overrides,
     _parse_cli_args,
     _parse_model_str,
@@ -22,6 +25,7 @@ from token_tracker import (
     export_csv,
     get_totals,
     main,
+    merge_ledger,
     scan_all,
     scan_opencode_db,
     scan_pi,
@@ -872,3 +876,235 @@ class TestLedgerSchema:
             get_totals()
         out = capsys.readouterr().out
         assert "Monthly Breakdown:" in out and "2023-01" in out
+
+
+class TestLocations:
+    """Declared locations augment auto-detected sources, each under its own label."""
+
+    def _patch_log(self, tmp_path):
+        log = tmp_path / "token_log.json"
+        return (
+            patch("token_tracker.TOKEN_LOG", log),
+            patch("token_tracker._LOCK_PATH", str(log) + ".lock"),
+            log,
+        )
+
+    def test_load_valid(self, tmp_path):
+        f = tmp_path / "locations.json"
+        f.write_text(json.dumps({"locations": [
+            {"label": "laptop", "type": "opencode", "path": "/a/opencode.db"},
+            {"label": "server1", "type": "pi", "path": "/srv/sessions"},
+        ]}))
+        assert _load_locations(str(f)) == [
+            Location("laptop", "opencode", "/a/opencode.db"),
+            Location("server1", "pi", "/srv/sessions"),
+        ]
+
+    def test_load_malformed_file(self, tmp_path, capsys):
+        f = tmp_path / "bad.json"
+        f.write_text("{not json")
+        assert _load_locations(str(f)) == []
+        assert "Could not read locations file" in capsys.readouterr().out
+
+    def test_load_skips_invalid_entries(self, tmp_path, capsys):
+        f = tmp_path / "locations.json"
+        f.write_text(json.dumps({"locations": [
+            {"label": "a@b", "type": "opencode", "path": "/x"},
+            {"label": "ok", "type": "unknown", "path": "/x"},
+            {"label": "ok", "type": "pi", "path": "/y"},
+            {"label": "ok2", "type": "pi", "path": ""},
+            "not-a-dict",
+        ]}))
+        assert _load_locations(str(f)) == [Location("ok", "pi", "/y")]
+        out = capsys.readouterr().out
+        assert "Skipping invalid location entry" in out
+        assert "Duplicate location label 'ok'" not in out  # first 'ok' was invalid
+
+    def test_load_duplicate_label(self, tmp_path, capsys):
+        f = tmp_path / "locations.json"
+        f.write_text(json.dumps({"locations": [
+            {"label": "dup", "type": "pi", "path": "/first"},
+            {"label": "dup", "type": "opencode", "path": "/second"},
+        ]}))
+        assert _load_locations(str(f)) == [Location("dup", "pi", "/first")]
+        assert "Duplicate location label 'dup'" in capsys.readouterr().out
+
+    def test_scan_all_combines_auto_and_locations(self, tmp_path, capsys):
+        auto_db = _make_db(tmp_path, [{"providerID": "p", "id": "m", "tokens": {"input": 10, "output": 1}}])
+        loc_dir = tmp_path / "loc"
+        loc_dir.mkdir()
+        loc_db = _make_db(loc_dir, [{"providerID": "q", "id": "n", "tokens": {"input": 20, "output": 2}}])
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("r", "o", 30, 3)])
+        loc_root = _write_pi_session(loc_dir / "pi", "srv", [_pi_line("s", "p", 40, 4)])
+        p1, p2, log = self._patch_log(tmp_path)
+        with p1, p2:
+            totals = scan_all(
+                db_path=str(auto_db),
+                sessions_dir=str(root),
+                env="t",
+                monthly=False,
+                locations=[
+                    Location("laptop", "opencode", str(loc_db)),
+                    Location("server1", "pi", str(loc_root)),
+                ],
+            )
+        assert ("opencode@t", "p/m") in totals
+        assert ("opencode@laptop", "q/n") in totals
+        assert ("oh-my-pi@t", "r/o") in totals
+        assert ("oh-my-pi@server1", "s/p") in totals
+        data = json.loads(log.read_text())
+        marks = data["_meta"]["watermark"]
+        assert {"opencode@t", "opencode@laptop", "oh-my-pi@t", "oh-my-pi@server1"} <= set(marks)
+
+    def test_missing_location_warns_and_continues(self, tmp_path, capsys):
+        db = _make_db(tmp_path, [{"providerID": "p", "id": "m", "tokens": {"input": 10, "output": 1}}])
+        p1, p2, _ = self._patch_log(tmp_path)
+        with p1, p2:
+            totals = scan_all(
+                db_path=str(db),
+                sessions_dir=str(tmp_path / "no-such-sessions"),
+                env="t",
+                monthly=False,
+                locations=[Location("ghost", "opencode", str(tmp_path / "gone.db"))],
+            )
+        assert ("opencode@t", "p/m") in totals
+        assert "Location 'ghost': no opencode database at" in capsys.readouterr().out
+
+    def test_scan_pi_filters_pi_locations(self, tmp_path):
+        root = _write_pi_session(tmp_path, "proj", [_pi_line("p", "m", 10, 1)])
+        loc_dir = tmp_path / "loc"
+        loc_dir.mkdir()
+        loc_root = _write_pi_session(loc_dir, "srv", [_pi_line("q", "n", 20, 2)])
+        (loc_dir / "oc").mkdir()
+        oc_db = _make_db(loc_dir / "oc", [{"providerID": "z", "id": "z", "tokens": {"input": 99, "output": 9}}])
+        p1, p2, log = self._patch_log(tmp_path)
+        with p1, p2:
+            totals = scan_pi(
+                sessions_dir=str(root),
+                env="t",
+                monthly=False,
+                locations=[
+                    Location("srv", "pi", str(loc_root)),
+                    Location("wrong", "opencode", str(oc_db)),  # filtered out by scan_pi
+                ],
+            )
+        assert "q/n" in totals  # scan_pi returns totals keyed by model (source stripped)
+        assert "z/z" not in totals  # opencode-kind location filtered out by scan_pi
+        data = json.loads(log.read_text())
+        assert "oh-my-pi@srv" in data["_meta"]["watermark"]
+        assert "opencode@wrong" not in data["_meta"]["watermark"]
+
+
+class TestMerge:
+    """merge folds a foreign ledger in, relabels watermark keys, and is idempotent."""
+
+    FOREIGN: ClassVar[dict] = {
+        "p/m": {"input": 100, "output": 5},
+        "_meta": {
+            "schema": 1,
+            "watermark": {"opencode@wsl": 100},
+            "last_scan": {"opencode@wsl": 90},
+            "months": {"2023-01": {"p/m": [100, 5]}},
+        },
+    }
+
+    def _merge(self, tmp_path, foreign, label="laptop"):
+        log = tmp_path / "data" / "token_log.json"
+        log.parent.mkdir(exist_ok=True)
+        f = tmp_path / "foreign.json"
+        f.write_text(json.dumps(foreign) if not isinstance(foreign, str) else foreign)
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            merge_ledger(str(f), label)
+        return log
+
+    def test_merge_adds_totals_relabels_and_buckets(self, tmp_path, capsys):
+        log = self._merge(tmp_path, self.FOREIGN)
+        out = capsys.readouterr().out
+        assert "Merged 1 model(s)" in out and "as laptop" in out
+        data = json.loads(log.read_text())
+        assert data["p/m"] == {"input": 100, "output": 5}
+        assert data["_meta"]["watermark"]["opencode@wsl@laptop"] == 100
+        assert data["_meta"]["last_scan"]["opencode@wsl@laptop"] == 90
+        assert data["_meta"]["months"]["2023-01"]["p/m"] == [100, 5]
+        assert data["_meta"]["merged"][0]["file"] == "foreign.json"
+
+    def test_merge_into_existing_ledger(self, tmp_path):
+        log = self._merge(tmp_path, self.FOREIGN)
+        log.write_text(json.dumps({
+            "p/m": {"input": 1, "output": 1},
+            "other/x": {"input": 7, "output": 7},
+            "_meta": {"watermark": {"opencode@wsl": 50}, "months": {"2023-01": {"p/m": [1, 1]}}},
+        }))
+        f = tmp_path / "foreign.json"
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            merge_ledger(str(f), "laptop")
+        data = json.loads(log.read_text())
+        assert data["p/m"] == {"input": 101, "output": 6}
+        assert data["other/x"] == {"input": 7, "output": 7}
+        # local watermark untouched (different key), months added element-wise
+        assert data["_meta"]["watermark"]["opencode@wsl"] == 50
+        assert data["_meta"]["months"]["2023-01"]["p/m"] == [101, 6]
+
+    def test_remerge_is_noop(self, tmp_path, capsys):
+        log = self._merge(tmp_path, self.FOREIGN)
+        before = log.read_text()
+        capsys.readouterr()
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            merge_ledger(str(tmp_path / "foreign.json"), "laptop")
+        assert "already merged" in capsys.readouterr().out
+        assert log.read_text() == before
+
+    def test_relabel_is_idempotent_on_merged_ledger(self, tmp_path):
+        # Merging a ledger that was itself merged must not double-suffix keys.
+        log = self._merge(tmp_path, self.FOREIGN)
+        relabeled = json.loads(log.read_text())
+        f2 = tmp_path / "again.json"
+        f2.write_text(json.dumps(relabeled))
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "fresh" / "token_log.json"), patch(
+            "token_tracker._LOCK_PATH", str(tmp_path / "fresh" / "token_log.json.lock")
+        ):
+            merge_ledger(str(f2), "laptop")
+        data = json.loads((tmp_path / "fresh" / "token_log.json").read_text())
+        assert "opencode@wsl@laptop" in data["_meta"]["watermark"]
+        assert not any(k.endswith("@laptop@laptop") for k in data["_meta"]["watermark"])
+
+    def test_bad_inputs_leave_ledger_untouched(self, tmp_path, capsys):
+        log = tmp_path / "data" / "token_log.json"
+        log.parent.mkdir(exist_ok=True)
+        log.write_text('{"p/m": {"input": 1, "output": 1}}')
+        before = log.read_text()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        empty = tmp_path / "empty.json"
+        empty.write_text("{}")
+        with patch("token_tracker.TOKEN_LOG", log), patch(
+            "token_tracker._LOCK_PATH", str(log) + ".lock"
+        ):
+            merge_ledger(str(bad), "laptop")
+            assert "Could not read foreign ledger" in capsys.readouterr().out
+            merge_ledger(str(empty), "laptop")
+            assert "no usage" in capsys.readouterr().out
+            merge_ledger(str(log), "laptop")
+            assert "Cannot merge the ledger into itself" in capsys.readouterr().out
+        assert log.read_text() == before
+
+    def test_cli_merge_args(self):
+        args = _parse_cli_args(["token_tracker.py", "merge", "f.json", "--as", "laptop"])
+        assert args["command"] == "merge"
+        assert args["merge_path"] == "f.json"
+        assert args["as_label"] == "laptop"
+        args = _parse_cli_args(["token_tracker.py", "scan-all", "--locations", "loc.json"])
+        assert args["locations_file"] == "loc.json"
+
+    def test_cli_merge_requires_args(self, tmp_path, capsys):
+        with patch("token_tracker.TOKEN_LOG", tmp_path / "token_log.json"):
+            main(["token_tracker.py", "merge"])
+            assert "merge requires a ledger path." in capsys.readouterr().out
+            main(["token_tracker.py", "merge", "f.json"])
+            assert "merge requires --as LABEL." in capsys.readouterr().out

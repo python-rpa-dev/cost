@@ -24,9 +24,10 @@ python token_tracker.py
 | Command | Description |
 |---------|-------------|
 | `python token_tracker.py [totals] [--pricing-file <path>]` | Print per-model totals (input/output tokens + cost) and the cumulative monthly breakdown |
-| `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan opencode SQLite database |
-| `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
-| `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly]` | Scan all client sources; one table with a Source column |
+| `python token_tracker.py scan-oc [--db-path <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly] [--locations <file>]` | Scan opencode SQLite database |
+| `python token_tracker.py scan-pi [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly] [--locations <file>]` | Scan oh-my-pi session logs (`~/.omp/agent/sessions`) |
+| `python token_tracker.py scan-all [--db-path <path>] [--sessions-dir <path>] [--pricing-file <path>] [--obfuscate] [--no-monthly] [--locations <file>]` | Scan all client sources; one table with a Source column |
+| `python token_tracker.py merge <ledger> --as <label>` | Fold another machine's ledger file into the local one (idempotent) |
 | `python token_tracker.py pricing` | Describe how pricing is configured and show the default fallback |
 | `python token_tracker.py export [--pricing-file <path>]` | Print the tracked ledger as CSV on stdout |
 | `python token_tracker.py clear` | Clear the token log file |
@@ -39,8 +40,24 @@ python token_tracker.py
 - `--no-monthly` - Suppress the monthly cost breakdown
 - `--since YYYY-MM-DD` / `--until YYYY-MM-DD` - Track only usage within a UTC date window, both ends inclusive (`scan-oc`/`scan-pi`/`scan-all`)
 - `--env NAME` - Environment label appended to scan sources and watermarks (default: auto-detect `wsl`/`windows`/`local`)
+- `--locations <file>` - JSON file of declared scan locations, added to the auto-detected sources (`scan-oc`/`scan-pi`/`scan-all`)
 
 Scans are idempotent per source *and* environment: each records only usage newer than its watermark (`opencode@wsl`, `oh-my-pi@windows`, …) stored under `_meta` in `data/token_log.json`. Running scans from WSL and Windows against the same repo folder aggregates both environments into one ledger without double-counting; the Source column shows which environment produced each row. `clear` resets the ledger (and watermarks); the next scan rebuilds it from full history. Repeated scans stay fast: pi session files untouched since the last full scan are skipped without being read.
+
+### Multi-location scanning
+
+`--locations` points at a JSON file declaring extra sources — e.g. databases or session dirs of other machines, reached through a mount (Windows share, `\\wsl$`, sshfs):
+
+```json
+{
+  "locations": [
+    {"label": "laptop", "type": "opencode", "path": "/mnt/c/Users/dev/AppData/Roaming/opencode/opencode.db"},
+    {"label": "server1", "type": "pi", "path": "/mnt/srv/omp-sessions"}
+  ]
+}
+```
+
+Each `label` becomes its own watermark namespace (`opencode@laptop`, `oh-my-pi@server1`), so every location tracks independently. Configured locations are *added* to the auto-detected local sources — don't declare a path that is also auto-detected, or it counts twice under two labels. For machines you can't reach at scan time, run the scanner there and shuttle its `data/token_log.json` back: `token_tracker.py merge foreign.json --as laptop` folds it in (model totals added, its watermark keys suffixed `@laptop`, re-merging the same file is a no-op).
 
 > A `token-tracker` console script is also installed (`pip install -e .`), so you can run e.g. `token-tracker scan-all`.
 

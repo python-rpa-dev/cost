@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -56,6 +57,14 @@ class UsageRecord(NamedTuple):
     output_tokens: float
     ts: float | None
     source: str = ""
+
+
+class Location(NamedTuple):
+    """One declared scan source: label namespaces watermarks, kind is "opencode"|"pi"."""
+
+    label: str
+    kind: str
+    path: str
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +149,47 @@ def _load_pricing_overrides(pricing_file: str | None = None) -> dict[str, PriceP
                     result[key] = pair
 
     return result
+
+
+def _load_locations(path: str) -> list[Location]:
+    """Parse a locations JSON file into declared scan sources; warn-and-skip invalid ones.
+
+    Format: ``{"locations": [{"label": ..., "type": "opencode"|"pi", "path": ...}, ...]}``.
+    A label must be a non-empty string without ``@`` so ``source@label`` watermark
+    keys stay unambiguous; duplicate labels keep the first occurrence.
+    """
+    data = _safe_read_json(Path(path))
+    if data is None:
+        print(f"Could not read locations file: {path}")
+        return []
+    entries = data.get("locations") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        print(f'Locations file must be {{"locations": [...]}}, got {path}')
+        return []
+
+    locations: list[Location] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            print(f"Skipping invalid location entry: {entry!r}")
+            continue
+        label, kind, loc_path = entry.get("label"), entry.get("type"), entry.get("path")
+        if (
+            not isinstance(label, str)
+            or not label
+            or "@" in label
+            or kind not in ("opencode", "pi")
+            or not isinstance(loc_path, str)
+            or not loc_path
+        ):
+            print(f"Skipping invalid location entry: {entry!r}")
+            continue
+        if label in seen:
+            print(f"Duplicate location label {label!r}; keeping the first.")
+            continue
+        seen.add(label)
+        locations.append(Location(label, kind, loc_path))
+    return locations
 
 
 def _get_pricing(model_key: str, overrides: dict[str, PricePair]) -> PricePair:
@@ -476,6 +526,26 @@ def _tag_env(records: list[UsageRecord], env: str) -> list[UsageRecord]:
     return [rec._replace(source=f"{rec.source}@{env}") for rec in records]
 
 
+def _collect_location(loc: Location, obfuscate: bool) -> list[UsageRecord] | None:
+    """Collect one declared location, tagged ``source@<label>``; None if source absent.
+
+    Passing ``loc.label`` as ``_collect_pi``'s env label makes its mtime
+    prefilter read ``_meta.last_scan["oh-my-pi@<label>"]``, matching the
+    tagged source key.
+    """
+    if loc.kind == "opencode":
+        db = Path(loc.path)
+        if not db.exists():
+            print(f"Location {loc.label!r}: no opencode database at {loc.path}.")
+            return None
+        recs = _opencode_records(db, obfuscate)
+    else:
+        recs = _collect_pi(loc.path, obfuscate, loc.label)
+    if recs is None:
+        return None
+    return _tag_env(recs, loc.label)
+
+
 def _accumulate_months(buckets: dict[str, Any], records: list[UsageRecord]) -> None:
     """Accumulate raw per-month/per-model tokens into the ledger's ``_meta.months``.
 
@@ -645,13 +715,8 @@ def _opencode_record(data_text: Any, time_created: Any) -> UsageRecord | None:
     )
 
 
-def _collect_opencode(db_path: str | None, obfuscate: bool) -> list[UsageRecord] | None:
-    """Gather usage records from the opencode DB; None if no source is present."""
-    db = _resolve_db_path(db_path)
-    if db is None:
-        print("No opencode database found.")
-        return None
-
+def _opencode_records(db: Path, obfuscate: bool) -> list[UsageRecord] | None:
+    """Read usage records from one opencode DB file; None if unreadable."""
     display_path = "..." + str(db)[-25:] if obfuscate else str(db)
 
     # Open read-only so a scan can never lock or modify a live opencode.db.
@@ -674,6 +739,15 @@ def _collect_opencode(db_path: str | None, obfuscate: bool) -> list[UsageRecord]
     return records
 
 
+def _collect_opencode(db_path: str | None, obfuscate: bool) -> list[UsageRecord] | None:
+    """Gather usage records from the auto-detected opencode DB; None if absent."""
+    db = _resolve_db_path(db_path)
+    if db is None:
+        print("No opencode database found.")
+        return None
+    return _opencode_records(db, obfuscate)
+
+
 def scan_opencode_db(
     db_path: str | None = None,
     pricing_file: str | None = None,
@@ -682,6 +756,7 @@ def scan_opencode_db(
     since_ts: float | None = None,
     until_ts: float | None = None,
     env: str | None = None,
+    locations: list[Location] | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan opencode SQLite database and track token usage.
 
@@ -692,14 +767,21 @@ def scan_opencode_db(
     database keeps an independent watermark in a shared ledger. Only usage
     newer than that watermark is tracked; *since_ts*/*until_ts* bound a UTC
     epoch-seconds window (start inclusive, end exclusive) and never advance
-    the watermark. Returns the newly tracked totals.
+    the watermark. *locations* adds declared ``opencode`` sources (each tagged
+    with its own label) on top of the auto-detected one. Returns the newly
+    tracked totals.
     """
     t0 = time.time()  # before collection: writes after this stamp stay visible
-    records = _collect_opencode(db_path, obfuscate)
-    if records is None:
+    auto = _collect_opencode(db_path, obfuscate)
+    records = _tag_env(auto, env or _detect_env()) if auto else []
+    for loc in locations or []:
+        if loc.kind == "opencode":
+            recs = _collect_location(loc, obfuscate)
+            if recs is not None:
+                records.extend(recs)
+    if not records:
         return {}
 
-    records = _tag_env(records, env or _detect_env())
     overrides = _load_pricing_overrides(pricing_file)
     totals = _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
     return {model: t for (_src, model), t in totals.items()}
@@ -796,6 +878,7 @@ def scan_pi(
     since_ts: float | None = None,
     until_ts: float | None = None,
     env: str | None = None,
+    locations: list[Location] | None = None,
 ) -> dict[str, TotalsEntry]:
     """Scan oh-my-pi session logs and track token usage.
 
@@ -807,15 +890,21 @@ def scan_pi(
     session directory keeps an independent watermark. Only usage newer than
     that watermark is tracked; *since_ts*/*until_ts* bound a UTC epoch-seconds
     window (start inclusive, end exclusive) and never advance the watermark.
-    Returns the newly tracked totals.
+    *locations* adds declared ``pi`` sources (each tagged with its own label)
+    on top of the auto-detected one. Returns the newly tracked totals.
     """
     t0 = time.time()  # before collection: writes after this stamp stay visible
     env_label = env or _detect_env()
-    records = _collect_pi(sessions_dir, obfuscate, env_label)
-    if records is None:
+    auto = _collect_pi(sessions_dir, obfuscate, env_label)
+    records = _tag_env(auto, env_label) if auto else []
+    for loc in locations or []:
+        if loc.kind == "pi":
+            recs = _collect_location(loc, obfuscate)
+            if recs is not None:
+                records.extend(recs)
+    if not records:
         return {}
 
-    records = _tag_env(records, env_label)
     overrides = _load_pricing_overrides(pricing_file)
     totals = _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
     return {model: t for (_src, model), t in totals.items()}
@@ -830,6 +919,7 @@ def scan_all(
     since_ts: float | None = None,
     until_ts: float | None = None,
     env: str | None = None,
+    locations: list[Location] | None = None,
 ) -> dict[tuple[str, str], TotalsEntry]:
     """Scan every known client source and report usage in one Source-tagged table.
 
@@ -837,10 +927,11 @@ def scan_all(
     reported and skipped. Records carry ``source@<env>`` labels (see
     :func:`scan_opencode_db`), so scans from several environments aggregate
     into one ledger with independent watermarks per source *and* environment.
-    Only usage newer than each watermark is tracked (*since_ts*/*until_ts*
-    additionally bound a UTC epoch-seconds window and never advance the
-    watermarks). Returns newly tracked totals keyed by ``(source@env, model)``;
-    the ledger persists per model (sources merged).
+    *locations* adds declared sources (each tagged with its own label) on top
+    of the auto-detected ones. Only usage newer than each watermark is tracked
+    (*since_ts*/*until_ts* additionally bound a UTC epoch-seconds window and
+    never advance the watermarks). Returns newly tracked totals keyed by
+    ``(source@env, model)``; the ledger persists per model (sources merged).
     """
     records: list[UsageRecord] = []
     found = False
@@ -855,6 +946,11 @@ def scan_all(
     if pi_records is not None:
         records.extend(_tag_env(pi_records, env_label))
         found = True
+    for loc in locations or []:
+        recs = _collect_location(loc, obfuscate)
+        if recs is not None:
+            records.extend(recs)
+            found = True
 
     if not found:
         print("No data sources found.")
@@ -862,6 +958,107 @@ def scan_all(
 
     overrides = _load_pricing_overrides(pricing_file)
     return _scan_report(records, overrides, monthly, since_ts, until_ts, scan_started=t0)
+
+
+def merge_ledger(path: str, label: str) -> None:
+    """Fold a foreign token_tracker ledger into the local one, idempotently.
+
+    Model totals are added; the foreign ``watermark``/``last_scan`` keys are
+    suffixed with ``@<label>`` so a foreign machine's ``opencode@wsl`` stays
+    distinct from the local one (keys already ending in ``@<label>`` come from
+    a previous merge and are kept as-is). Month buckets are added per
+    month/model. The foreign file's SHA-256 is recorded under
+    ``_meta.merged``; re-merging identical content is a no-op.
+    """
+    foreign_path = Path(path)
+    if foreign_path.resolve() == TOKEN_LOG.resolve():
+        print("Cannot merge the ledger into itself.")
+        return
+    foreign = _safe_read_json(foreign_path)
+    if foreign is None:
+        print(f"Could not read foreign ledger: {path}")
+        return
+    if not isinstance(foreign, dict):
+        print("Foreign ledger is not a JSON object.")
+        return
+    models = {k: v for k, v in foreign.items() if not k.startswith("_") and isinstance(v, dict)}
+    if not models:
+        print("Foreign ledger has no usage.")
+        return
+
+    try:
+        digest = hashlib.sha256(foreign_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        print(f"Could not read foreign ledger: {path} ({exc})")
+        return
+
+    _ensure_data_dir()
+    with FileLock(_LOCK_PATH, timeout=10):
+        log = _safe_read_json(TOKEN_LOG) or {}
+        meta = log.setdefault("_meta", {})
+        if not isinstance(meta, dict):
+            meta = {"watermark": {}, "last_scan": {}, "months": {}, "merged": []}
+            log["_meta"] = meta
+        merged = meta.setdefault("merged", [])
+        if isinstance(merged, list) and any(
+            isinstance(m, dict) and m.get("sha256") == digest for m in merged
+        ):
+            print("Foreign ledger already merged (same content); skipping.")
+            return
+
+        count = 0
+        for model, data in models.items():
+            with contextlib.suppress(TypeError, ValueError):
+                in_tok, out_tok = float(data.get("input", 0)), float(data.get("output", 0))
+                entry = log.setdefault(model, {"input": 0, "output": 0})
+                if isinstance(entry, dict):
+                    entry["input"] += in_tok
+                    entry["output"] += out_tok
+                    count += 1
+
+        def relabel(keys: dict[str, Any]) -> dict[str, Any]:
+            return {k if k.endswith(f"@{label}") else f"{k}@{label}": v for k, v in keys.items()}
+
+        for meta_key in ("watermark", "last_scan"):
+            foreign_map = foreign.get("_meta", {}).get(meta_key) if isinstance(foreign.get("_meta"), dict) else None
+            if not isinstance(foreign_map, dict):
+                continue
+            local_map = meta.setdefault(meta_key, {})
+            if not isinstance(local_map, dict):
+                continue
+            for key, value in relabel(foreign_map).items():
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                prev = local_map.get(key)
+                if not isinstance(prev, (int, float)) or isinstance(prev, bool) or value > prev:
+                    local_map[key] = value
+
+        foreign_months = foreign.get("_meta", {}).get("months") if isinstance(foreign.get("_meta"), dict) else None
+        if isinstance(foreign_months, dict):
+            local_months = meta.setdefault("months", {})
+            if isinstance(local_months, dict):
+                for month, per_model in foreign_months.items():
+                    if not isinstance(per_model, dict):
+                        continue
+                    bucket = local_months.setdefault(month, {})
+                    if not isinstance(bucket, dict):
+                        continue
+                    for model_key, pair in per_model.items():
+                        if not (isinstance(pair, list) and len(pair) == 2):
+                            continue
+                        try:
+                            add = [float(pair[0]), float(pair[1])]
+                        except (TypeError, ValueError):
+                            continue
+                        prev = bucket.get(model_key)
+                        base = prev if isinstance(prev, list) and len(prev) == 2 else [0, 0]
+                        bucket[model_key] = [base[0] + add[0], base[1] + add[1]]
+
+        meta["schema"] = _LEDGER_SCHEMA
+        if isinstance(merged, list):
+            merged.append({"sha256": digest, "file": foreign_path.name, "at": int(time.time())})
+        _write_log(log)
+    print(f"Merged {count} model(s) from {path} as {label}.")
 
 
 def clear_log() -> None:
@@ -897,8 +1094,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="totals",
-        choices=["totals", "scan-oc", "scan-pi", "scan-all", "clear", "pricing", "export"],
+        choices=["totals", "scan-oc", "scan-pi", "scan-all", "clear", "pricing", "export", "merge"],
         help="Command to run (default: totals)",
+    )
+    parser.add_argument(
+        "merge_path",
+        nargs="?",
+        metavar="LEDGER",
+        default=None,
+        help="Foreign ledger file for the merge command",
     )
     parser.add_argument("--pricing-file", metavar="PATH", default=None, help="External JSON pricing overrides")
     parser.add_argument("--obfuscate", action="store_true", help="Truncate the data path in output")
@@ -932,6 +1136,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Environment label appended to scan sources and watermarks (default: auto-detect wsl/windows/local)",
     )
+    parser.add_argument(
+        "--locations",
+        metavar="PATH",
+        default=None,
+        help="JSON file of declared scan locations (scan-oc/scan-pi/scan-all)",
+    )
+    parser.add_argument(
+        "--as",
+        dest="as_label",
+        metavar="LABEL",
+        default=None,
+        help="Label namespaces a merged foreign ledger's watermark keys",
+    )
     return parser
 
 
@@ -946,6 +1163,9 @@ def _parse_cli_args(argv: list[str]) -> dict[str, Any]:
         "db_path": ns.db_path,
         "sessions_dir": ns.sessions_dir,
         "env": ns.env,
+        "locations_file": ns.locations,
+        "merge_path": ns.merge_path,
+        "as_label": ns.as_label,
         "since_ts": ns.since,
         # --until names an inclusive calendar day; the window end is exclusive.
         "until_ts": None if ns.until is None else ns.until + 86_400,
@@ -959,6 +1179,7 @@ def main(argv: list[str] | None = None) -> None:
 
     parsed = _parse_cli_args(argv)
     cmd = parsed["command"]
+    locations = _load_locations(parsed["locations_file"]) if parsed["locations_file"] else []
 
     if cmd == "scan-oc":
         scan_opencode_db(
@@ -969,6 +1190,7 @@ def main(argv: list[str] | None = None) -> None:
             since_ts=parsed["since_ts"],
             until_ts=parsed["until_ts"],
             env=parsed["env"],
+            locations=locations,
         )
     elif cmd == "scan-pi":
         scan_pi(
@@ -979,6 +1201,7 @@ def main(argv: list[str] | None = None) -> None:
             since_ts=parsed["since_ts"],
             until_ts=parsed["until_ts"],
             env=parsed["env"],
+            locations=locations,
         )
     elif cmd == "scan-all":
         scan_all(
@@ -990,7 +1213,15 @@ def main(argv: list[str] | None = None) -> None:
             since_ts=parsed["since_ts"],
             until_ts=parsed["until_ts"],
             env=parsed["env"],
+            locations=locations,
         )
+    elif cmd == "merge":
+        if not parsed["merge_path"]:
+            print("merge requires a ledger path.")
+        elif not parsed["as_label"]:
+            print("merge requires --as LABEL.")
+        else:
+            merge_ledger(parsed["merge_path"], parsed["as_label"])
     elif cmd == "clear":
         clear_log()
     elif cmd == "pricing":
